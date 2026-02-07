@@ -91,6 +91,14 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);",
 )
 
+FTS_STATEMENTS = (
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts
+    USING fts5(symbol_id UNINDEXED, name, qualified_name, docstring, signature);
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_symbol_fts_symbol_id ON symbol_fts(symbol_id);",
+)
+
 
 class Database:
     def __init__(self, db_path: Path) -> None:
@@ -108,6 +116,11 @@ class Database:
             conn.execute("PRAGMA journal_mode = WAL;")
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            for statement in FTS_STATEMENTS:
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError:
+                    continue
             conn.commit()
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
@@ -139,6 +152,16 @@ class Database:
 
     def replace_file_symbols(self, file_path: str, symbols: Sequence[SymbolRecord]) -> None:
         with closing(self.connect()) as conn:
+            old_symbol_rows = conn.execute(
+                "SELECT id FROM symbols WHERE file_path = ?;",
+                (file_path,),
+            ).fetchall()
+            old_symbol_ids = [int(row["id"]) for row in old_symbol_rows]
+            for symbol_id in old_symbol_ids:
+                try:
+                    conn.execute("DELETE FROM symbol_fts WHERE symbol_id = ?;", (symbol_id,))
+                except sqlite3.OperationalError:
+                    break
             conn.execute(
                 "DELETE FROM parameters WHERE symbol_id IN (SELECT id FROM symbols WHERE file_path = ?);",
                 (file_path,),
@@ -184,6 +207,22 @@ class Database:
                             param.default_value,
                         ),
                     )
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO symbol_fts(symbol_id, name, qualified_name, docstring, signature)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (
+                            symbol_id,
+                            symbol.name,
+                            symbol.qualified_name,
+                            symbol.docstring or "",
+                            symbol.signature or "",
+                        ),
+                    )
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def replace_file_edges(self, file_path: str, edges: Sequence[EdgeRecord]) -> None:
@@ -234,6 +273,15 @@ class Database:
 
     def delete_file_graph(self, file_path: str) -> None:
         with closing(self.connect()) as conn:
+            symbol_rows = conn.execute(
+                "SELECT id FROM symbols WHERE file_path = ?;",
+                (file_path,),
+            ).fetchall()
+            for row in symbol_rows:
+                try:
+                    conn.execute("DELETE FROM symbol_fts WHERE symbol_id = ?;", (int(row["id"]),))
+                except sqlite3.OperationalError:
+                    break
             conn.execute("DELETE FROM edges WHERE file_path = ?;", (file_path,))
             conn.execute("DELETE FROM external_deps WHERE file_path = ?;", (file_path,))
             conn.execute(

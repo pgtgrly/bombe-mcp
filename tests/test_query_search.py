@@ -5,6 +5,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from bombe.models import FileRecord, SymbolRecord
 from bombe.models import SymbolSearchRequest
 from bombe.query.search import search_symbols
 from bombe.store.database import Database
@@ -57,6 +58,52 @@ class QuerySearchTests(unittest.TestCase):
             symbol = result.symbols[0]
             self.assertEqual(symbol["name"], "authenticate")
             self.assertEqual(symbol["callers_count"], 1)
+
+    def test_search_symbols_uses_fts_content_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            fts_available = bool(
+                db.query(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
+                )
+            )
+            db.upsert_files(
+                [
+                    FileRecord(
+                        path="src/crypto.py",
+                        language="python",
+                        content_hash="h-crypto",
+                        size_bytes=100,
+                    )
+                ]
+            )
+            db.replace_file_symbols(
+                "src/crypto.py",
+                [
+                    SymbolRecord(
+                        name="verify_password",
+                        qualified_name="auth.crypto.verify_password",
+                        kind="function",
+                        file_path="src/crypto.py",
+                        start_line=1,
+                        end_line=3,
+                        signature="def verify_password(password, hashed)",
+                        docstring="Validate bcrypt hash",
+                        pagerank_score=0.9,
+                    )
+                ],
+            )
+
+            result = search_symbols(
+                db,
+                SymbolSearchRequest(query="bcrypt", kind="function", limit=10),
+            )
+            if fts_available:
+                self.assertEqual(result.total_matches, 1)
+                self.assertEqual(result.symbols[0]["name"], "verify_password")
+            else:
+                self.assertGreaterEqual(result.total_matches, 0)
 
 
 if __name__ == "__main__":

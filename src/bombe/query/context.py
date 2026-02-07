@@ -53,26 +53,44 @@ def _pick_seeds(conn, req: ContextRequest) -> list[int]:
         if seeds:
             return seeds
 
-    words = [word.strip().lower() for word in req.query.split() if word.strip()]
+    query_text = req.query.strip()
+    try:
+        rows = conn.execute(
+            """
+            SELECT s.id
+            FROM symbol_fts
+            JOIN symbols s ON s.id = symbol_fts.symbol_id
+            WHERE symbol_fts MATCH ?
+            ORDER BY bm25(symbol_fts), s.pagerank_score DESC
+            LIMIT 8;
+            """,
+            (query_text,),
+        ).fetchall()
+        if rows:
+            return [int(row["id"]) for row in rows]
+    except Exception:
+        pass
+
+    words = [word.strip().lower() for word in query_text.split() if word.strip()]
     if not words:
         return []
-    clauses = " OR ".join(["LOWER(name) LIKE ?"] * len(words))
-    params = tuple(f"%{word}%" for word in words)
+    clauses = " OR ".join(["LOWER(name) LIKE ?" for _ in words] + ["LOWER(qualified_name) LIKE ?" for _ in words])
+    params = tuple([f"%{word}%" for word in words] + [f"%{word}%" for word in words])
     rows = conn.execute(
         f"""
         SELECT id
         FROM symbols
         WHERE {clauses}
         ORDER BY pagerank_score DESC
-        LIMIT 5;
+        LIMIT 8;
         """,
         params,
     ).fetchall()
     return [int(row["id"]) for row in rows]
 
 
-def _expand(conn, seeds: list[int], depth: int) -> dict[int, tuple[int, float]]:
-    reached: dict[int, tuple[int, float]] = {seed: (0, 1.0) for seed in seeds}
+def _expand(conn, seeds: list[int], depth: int) -> dict[int, int]:
+    reached: dict[int, int] = {seed: 0 for seed in seeds}
     queue = deque((seed, 0) for seed in seeds)
     rel_placeholders = ", ".join("?" for _ in RELATIONSHIPS)
 
@@ -94,12 +112,59 @@ def _expand(conn, seeds: list[int], depth: int) -> dict[int, tuple[int, float]]:
         for row in rows:
             neighbor = int(row["target_id"]) if int(row["source_id"]) == current else int(row["source_id"])
             next_depth = current_depth + 1
-            score = 1.0 * (0.7 ** next_depth)
             previous = reached.get(neighbor)
-            if previous is None or next_depth < previous[0]:
-                reached[neighbor] = (next_depth, score)
+            if previous is None or next_depth < previous:
+                reached[neighbor] = next_depth
                 queue.append((neighbor, next_depth))
     return reached
+
+
+def _personalized_pagerank(
+    conn,
+    seeds: list[int],
+    nodes: list[int],
+    damping: float = 0.85,
+    iterations: int = 20,
+) -> dict[int, float]:
+    if not nodes:
+        return {}
+    rel_placeholders = ", ".join("?" for _ in RELATIONSHIPS)
+    node_set = set(nodes)
+    adjacency: dict[int, list[int]] = {node: [] for node in nodes}
+    rows = conn.execute(
+        f"""
+        SELECT source_id, target_id
+        FROM edges
+        WHERE source_type = 'symbol'
+          AND target_type = 'symbol'
+          AND relationship IN ({rel_placeholders});
+        """,
+        RELATIONSHIPS,
+    ).fetchall()
+    for row in rows:
+        source = int(row["source_id"])
+        target = int(row["target_id"])
+        if source in node_set and target in node_set:
+            adjacency[source].append(target)
+            adjacency[target].append(source)
+
+    seed_set = set(seeds)
+    restart = {
+        node: (1.0 / len(seed_set)) if node in seed_set and seed_set else 0.0
+        for node in nodes
+    }
+    scores = {node: restart[node] for node in nodes}
+
+    for _ in range(iterations):
+        next_scores = {node: (1.0 - damping) * restart[node] for node in nodes}
+        for source, targets in adjacency.items():
+            if not targets:
+                continue
+            share = damping * scores[source] / len(targets)
+            for target in targets:
+                next_scores[target] += share
+        scores = next_scores
+    return scores
 
 
 def get_context(db: Database, req: ContextRequest) -> ContextResponse:
@@ -124,6 +189,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         reached = _expand(conn, seeds, req.expansion_depth)
         symbol_ids = tuple(reached.keys())
         placeholders = ", ".join("?" for _ in symbol_ids)
+        ppr_scores = _personalized_pagerank(conn, seeds, list(symbol_ids))
         symbol_rows = conn.execute(
             f"""
             SELECT id, name, kind, qualified_name, file_path, start_line, end_line, signature, pagerank_score
@@ -136,9 +202,10 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         ranked: list[tuple[float, dict[str, object]]] = []
         for row in symbol_rows:
             symbol_id = int(row["id"])
-            depth, ppr = reached[symbol_id]
+            depth = reached[symbol_id]
+            ppr = ppr_scores.get(symbol_id, 0.0)
             proximity_bonus = {0: 1.0, 1: 0.7, 2: 0.4}.get(depth, 0.25)
-            score = ppr * float(row["pagerank_score"] or 0.0) * proximity_bonus
+            score = ppr * max(float(row["pagerank_score"] or 0.0), 1e-9) * proximity_bonus
             ranked.append(
                 (
                     score,
@@ -184,6 +251,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             tokens_used += symbol_tokens
             included_symbols.append(
                 {
+                    "id": symbol["id"],
                     "name": symbol["name"],
                     "kind": symbol["kind"],
                     "lines": f"{symbol['start_line']}-{symbol['end_line']}",
@@ -191,16 +259,21 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                     "source": source,
                     "file_path": symbol["file_path"],
                     "depth": symbol["depth"],
+                    "qualified_name": symbol["qualified_name"],
                 }
             )
 
         files: dict[str, list[dict[str, object]]] = {}
         for symbol in included_symbols:
             files.setdefault(str(symbol["file_path"]), []).append(symbol)
-        file_entries = [{"path": path, "symbols": symbols} for path, symbols in files.items()]
+        file_entries = []
+        for path, symbols in files.items():
+            symbols.sort(key=lambda item: int(str(item["lines"]).split("-")[0]))
+            file_entries.append({"path": path, "symbols": symbols})
+        file_entries.sort(key=lambda item: item["path"])
 
         summary = f"Selected {len(included_symbols)} symbols from {len(file_entries)} files."
-        relationship_map = " -> ".join(str(symbol["name"]) for symbol in included_symbols[:6])
+        relationship_map = " -> ".join(str(symbol["name"]) for symbol in included_symbols[:8])
 
         payload = {
             "query": req.query,

@@ -8,10 +8,31 @@ from bombe.models import SymbolSearchRequest, SymbolSearchResponse
 from bombe.store.database import Database
 
 
-def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchResponse:
+def _count_refs(conn, symbol_id: int) -> tuple[int, int]:
+    callers_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM edges
+        WHERE relationship = 'CALLS' AND target_type = 'symbol' AND target_id = ?;
+        """,
+        (symbol_id,),
+    ).fetchone()["count"]
+    callees_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM edges
+        WHERE relationship = 'CALLS' AND source_type = 'symbol' AND source_id = ?;
+        """,
+        (symbol_id,),
+    ).fetchone()["count"]
+    return int(callers_count), int(callees_count)
+
+
+def _search_with_like(conn, req: SymbolSearchRequest):
     query_value = f"%{req.query.lower()}%"
     params: list[object] = [query_value]
-    where_clauses = ["LOWER(name) LIKE ?"]
+    where_clauses = ["(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)"]
+    params.append(query_value)
 
     if req.kind != "any":
         where_clauses.append("kind = ?")
@@ -29,28 +50,48 @@ def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchRespon
         LIMIT ?;
     """
     params.append(req.limit)
+    return conn.execute(sql, tuple(params)).fetchall()
 
+
+def _search_with_fts(conn, req: SymbolSearchRequest):
+    query = req.query.strip()
+    if not query:
+        return []
+    params: list[object] = [query]
+    where_clauses = ["symbol_fts MATCH ?"]
+    if req.kind != "any":
+        where_clauses.append("s.kind = ?")
+        params.append(req.kind)
+    if req.file_pattern:
+        where_clauses.append("s.file_path LIKE ?")
+        params.append(req.file_pattern.replace("*", "%"))
+    params.append(req.limit)
+
+    sql = f"""
+        SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path, s.start_line, s.end_line,
+               s.signature, s.visibility, s.pagerank_score, bm25(symbol_fts) AS rank
+        FROM symbol_fts f
+        JOIN symbols s ON s.id = f.symbol_id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY rank ASC, s.pagerank_score DESC
+        LIMIT ?;
+    """
+    return conn.execute(sql, tuple(params)).fetchall()
+
+
+def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchResponse:
     with closing(db.connect()) as conn:
-        rows = conn.execute(sql, tuple(params)).fetchall()
+        try:
+            rows = _search_with_fts(conn, req)
+        except Exception:
+            rows = []
+        if not rows:
+            rows = _search_with_like(conn, req)
+
         payload: list[dict[str, object]] = []
         for row in rows:
             symbol_id = int(row["id"])
-            callers_count = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM edges
-                WHERE relationship = 'CALLS' AND target_type = 'symbol' AND target_id = ?;
-                """,
-                (symbol_id,),
-            ).fetchone()["count"]
-            callees_count = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM edges
-                WHERE relationship = 'CALLS' AND source_type = 'symbol' AND source_id = ?;
-                """,
-                (symbol_id,),
-            ).fetchone()["count"]
+            callers_count, callees_count = _count_refs(conn, symbol_id)
             payload.append(
                 {
                     "name": row["name"],
