@@ -83,12 +83,34 @@ def _walk(
                 """,
                 (current,),
             ).fetchall()
-        else:
+        elif direction == "callees":
             rows = conn.execute(
                 """
                 SELECT target_id AS next_id, line_number
                 FROM edges
                 WHERE relationship = 'CALLS'
+                  AND source_type = 'symbol'
+                  AND source_id = ?;
+                """,
+                (current,),
+            ).fetchall()
+        elif direction == "implementors":
+            rows = conn.execute(
+                """
+                SELECT source_id AS next_id, line_number
+                FROM edges
+                WHERE relationship = 'IMPLEMENTS'
+                  AND target_type = 'symbol'
+                  AND target_id = ?;
+                """,
+                (current,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT target_id AS next_id, line_number
+                FROM edges
+                WHERE relationship IN ('EXTENDS', 'IMPLEMENTS')
                   AND source_type = 'symbol'
                   AND source_id = ?;
                 """,
@@ -122,6 +144,8 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
             },
             "callers": [],
             "callees": [],
+            "implementors": [],
+            "supers": [],
         }
 
         directions = []
@@ -129,6 +153,10 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
             directions.append("callers")
         if req.direction in {"callees", "both"}:
             directions.append("callees")
+        if req.direction == "implementors":
+            directions.append("implementors")
+        if req.direction == "supers":
+            directions.append("supers")
 
         for direction in directions:
             entries = _walk(conn, symbol_id, direction, req.depth)

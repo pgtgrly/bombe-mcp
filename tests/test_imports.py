@@ -13,6 +13,7 @@ class ImportResolutionTests(unittest.TestCase):
         all_files = {
             "src/app.py": FileRecord("src/app.py", "python", "h1"),
             "pkg/auth.py": FileRecord("pkg/auth.py", "python", "h2"),
+            "src/pkg/helpers.py": FileRecord("src/pkg/helpers.py", "python", "h3"),
         }
         source = all_files["src/app.py"]
         imports = [
@@ -21,10 +22,16 @@ class ImportResolutionTests(unittest.TestCase):
                 import_statement="from pkg.auth import login",
                 module_name="pkg.auth",
                 line_number=1,
-            )
+            ),
+            ImportRecord(
+                source_file_path=source.path,
+                import_statement="from .pkg import helpers",
+                module_name=".pkg.helpers",
+                line_number=2,
+            ),
         ]
         edges, external = resolve_imports(".", source, imports, all_files)
-        self.assertEqual(len(edges), 1)
+        self.assertEqual(len(edges), 2)
         self.assertEqual(edges[0].relationship, "IMPORTS")
         self.assertEqual(len(external), 0)
 
@@ -34,6 +41,9 @@ class ImportResolutionTests(unittest.TestCase):
             "com/example/auth/AuthService.java": FileRecord(
                 "com/example/auth/AuthService.java", "java", "h2"
             ),
+            "com/example/auth/AuthPolicy.java": FileRecord(
+                "com/example/auth/AuthPolicy.java", "java", "h3"
+            ),
         }
         source = all_files["com/example/Main.java"]
         imports = [
@@ -42,16 +52,23 @@ class ImportResolutionTests(unittest.TestCase):
                 import_statement="import com.example.auth.AuthService;",
                 module_name="com.example.auth.AuthService",
                 line_number=2,
-            )
+            ),
+            ImportRecord(
+                source_file_path=source.path,
+                import_statement="import com.example.auth.*;",
+                module_name="com.example.auth.*",
+                line_number=3,
+            ),
         ]
         edges, external = resolve_imports(".", source, imports, all_files)
-        self.assertEqual(len(edges), 1)
+        self.assertEqual(len(edges), 2)
         self.assertEqual(len(external), 0)
 
     def test_resolve_typescript_imports(self) -> None:
         all_files = {
             "src/main.ts": FileRecord("src/main.ts", "typescript", "h1"),
             "src/utils/index.ts": FileRecord("src/utils/index.ts", "typescript", "h2"),
+            "src/ui/button.jsx": FileRecord("src/ui/button.jsx", "typescript", "h3"),
         }
         source = all_files["src/main.ts"]
         imports = [
@@ -60,10 +77,16 @@ class ImportResolutionTests(unittest.TestCase):
                 import_statement="import { x } from './utils';",
                 module_name="./utils",
                 line_number=1,
-            )
+            ),
+            ImportRecord(
+                source_file_path=source.path,
+                import_statement="import Button from './ui/button';",
+                module_name="./ui/button",
+                line_number=2,
+            ),
         ]
         edges, external = resolve_imports(".", source, imports, all_files)
-        self.assertEqual(len(edges), 1)
+        self.assertEqual(len(edges), 2)
         self.assertEqual(len(external), 0)
 
     def test_resolve_go_imports_with_module(self) -> None:
@@ -75,6 +98,7 @@ class ImportResolutionTests(unittest.TestCase):
             all_files = {
                 "cmd/main.go": FileRecord("cmd/main.go", "go", "h1"),
                 "pkg/auth/service.go": FileRecord("pkg/auth/service.go", "go", "h2"),
+                "pkg/local/local.go": FileRecord("pkg/local/local.go", "go", "h3"),
             }
             source = all_files["cmd/main.go"]
             imports = [
@@ -83,10 +107,16 @@ class ImportResolutionTests(unittest.TestCase):
                     import_statement='import "github.com/example/project/pkg/auth"',
                     module_name="github.com/example/project/pkg/auth",
                     line_number=1,
-                )
+                ),
+                ImportRecord(
+                    source_file_path=source.path,
+                    import_statement='import "../pkg/local"',
+                    module_name="../pkg/local",
+                    line_number=2,
+                ),
             ]
             edges, external = resolve_imports(str(repo_root), source, imports, all_files)
-            self.assertEqual(len(edges), 1)
+            self.assertEqual(len(edges), 2)
             self.assertEqual(len(external), 0)
 
     def test_unresolved_imports_become_external(self) -> None:

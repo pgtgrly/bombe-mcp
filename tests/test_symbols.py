@@ -13,12 +13,14 @@ class SymbolExtractionTests(unittest.TestCase):
         source = (
             "import os\n"
             "from app.auth import login\n"
+            "MAX_RETRIES = 3\n"
             "\n"
             "class Service:\n"
-            "    def run(self, user):\n"
+            "    \"\"\"Service docs\"\"\"\n"
+            "    def run(self, user) -> str:\n"
             "        return user\n"
             "\n"
-            "async def handler(name: str):\n"
+            "async def handler(name: str) -> str:\n"
             "    return name\n"
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -32,10 +34,15 @@ class SymbolExtractionTests(unittest.TestCase):
             self.assertIn(("Service", "class"), names)
             self.assertIn(("run", "method"), names)
             self.assertIn(("handler", "function"), names)
+            self.assertIn(("MAX_RETRIES", "constant"), names)
 
             handler = next(symbol for symbol in symbols if symbol.name == "handler")
             self.assertTrue(handler.is_async)
             self.assertGreaterEqual(handler.end_line, handler.start_line)
+            self.assertEqual(handler.return_type, "str")
+            self.assertIn("-> str", handler.signature)
+            class_symbol = next(symbol for symbol in symbols if symbol.name == "Service")
+            self.assertEqual(class_symbol.docstring, "Service docs")
 
             import_modules = sorted(import_record.module_name for import_record in imports)
             self.assertEqual(import_modules, ["app.auth", "os"])
@@ -46,7 +53,7 @@ class SymbolExtractionTests(unittest.TestCase):
             "import java.util.List;\n"
             "\n"
             "public class AuthService {\n"
-            "    public boolean login(String user, String pass) {\n"
+            "    public static boolean login(String user, String pass) {\n"
             "        return true;\n"
             "    }\n"
             "}\n"
@@ -64,6 +71,10 @@ class SymbolExtractionTests(unittest.TestCase):
             login = next(symbol for symbol in symbols if symbol.name == "login")
             self.assertEqual(login.parameters[0].name, "user")
             self.assertEqual(login.parameters[0].type, "String")
+            self.assertEqual(login.return_type, "boolean")
+            self.assertTrue(login.is_static)
+            auth_service = next(symbol for symbol in symbols if symbol.name == "AuthService")
+            self.assertGreaterEqual(auth_service.end_line, auth_service.start_line)
 
     def test_extract_typescript_symbols_and_imports(self) -> None:
         source = (
@@ -71,6 +82,7 @@ class SymbolExtractionTests(unittest.TestCase):
             "export interface AuthPort {\n"
             "  login(name: string): Promise<boolean>;\n"
             "}\n"
+            "export const API_URL = 'https://example.com';\n"
             "export class AuthService {\n"
             "  async login(name: string): Promise<boolean> {\n"
             "    return true;\n"
@@ -91,10 +103,14 @@ class SymbolExtractionTests(unittest.TestCase):
             self.assertIn(("login", "method"), names)
             self.assertIn(("makeToken", "function"), names)
             self.assertIn(("logout", "function"), names)
+            self.assertIn(("API_URL", "constant"), names)
             self.assertEqual(imports[0].module_name, "./models")
             logout = next(symbol for symbol in symbols if symbol.name == "logout")
             self.assertEqual(logout.parameters[0].name, "userId")
             self.assertEqual(logout.parameters[0].type, "string")
+            self.assertEqual(logout.return_type, None)
+            login = next(symbol for symbol in symbols if symbol.name == "login")
+            self.assertEqual(login.return_type, "Promise<boolean>")
 
     def test_extract_go_symbols_and_imports(self) -> None:
         source = (
@@ -102,6 +118,7 @@ class SymbolExtractionTests(unittest.TestCase):
             "import (\n"
             "  \"context\"\n"
             ")\n"
+            "const MaxRetries = 3\n"
             "type Service struct {}\n"
             "type Reader interface {}\n"
             "func Login(name string) bool {\n"
@@ -122,10 +139,12 @@ class SymbolExtractionTests(unittest.TestCase):
             self.assertIn(("Reader", "interface"), names)
             self.assertIn(("Login", "function"), names)
             self.assertIn(("Verify", "method"), names)
+            self.assertIn(("MaxRetries", "constant"), names)
             self.assertEqual(imports[0].module_name, "context")
             login = next(symbol for symbol in symbols if symbol.name == "Login")
             self.assertEqual(login.parameters[0].name, "name")
             self.assertEqual(login.parameters[0].type, "string")
+            self.assertEqual(login.return_type, "bool")
 
 
 if __name__ == "__main__":

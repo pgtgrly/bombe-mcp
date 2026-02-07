@@ -13,8 +13,19 @@ class FakeServer:
     def __init__(self) -> None:
         self.registered: dict[str, dict[str, object]] = {}
 
-    def register_tool(self, name: str, description: str, handler) -> None:
-        self.registered[name] = {"description": description, "handler": handler}
+    def register_tool(self, name: str, description: str, input_schema_or_handler, handler=None) -> None:
+        if handler is None:
+            self.registered[name] = {
+                "description": description,
+                "input_schema": None,
+                "handler": input_schema_or_handler,
+            }
+            return
+        self.registered[name] = {
+            "description": description,
+            "input_schema": input_schema_or_handler,
+            "handler": handler,
+        }
 
 
 class MCPContractTests(unittest.TestCase):
@@ -64,6 +75,7 @@ class MCPContractTests(unittest.TestCase):
                 "get_structure",
                 "get_blast_radius",
             })
+            self.assertIsNotNone(fake_server.registered["search_symbols"]["input_schema"])
 
             registry = build_tool_registry(db, root.as_posix())
             search_payload = registry["search_symbols"]["handler"]({"query": "auth"})

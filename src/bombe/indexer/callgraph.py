@@ -11,6 +11,11 @@ from bombe.models import EdgeRecord, ParsedUnit, SymbolRecord
 
 
 CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+TS_IMPORT_RE = re.compile(r"""import(?:\s+type)?\s+.*?\s+from\s+['"]([^'"]+)['"]""")
+PY_FROM_RE = re.compile(r"""from\s+([A-Za-z0-9_\.]+)\s+import""")
+PY_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_\.]+)""")
+JAVA_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_.*]+);""")
+GO_IMPORT_RE = re.compile(r'''"([^"]+)"''')
 CALL_KEYWORDS = {
     "if",
     "for",
@@ -60,6 +65,9 @@ def _extract_regex_calls(parsed: ParsedUnit) -> list[CallSite]:
             name = match.group(1)
             if name in CALL_KEYWORDS:
                 continue
+            prefix = line[: match.start()].strip()
+            if prefix.endswith(("def", "function", "func", "class", "new")):
+                continue
             callsites.append(CallSite(callee_name=name, line_number=index))
     return callsites
 
@@ -85,14 +93,36 @@ def _import_hints(source: str) -> set[str]:
     hints: set[str] = set()
     for line in source.splitlines():
         normalized = line.strip()
-        if normalized.startswith("import "):
-            for token in re.split(r"[\s,;]+", normalized):
-                if "." in token:
-                    hints.add(token.strip("\"'"))
-        if normalized.startswith("from "):
-            parts = normalized.split(" ")
-            if len(parts) > 1:
-                hints.add(parts[1].strip("\"'"))
+        from_match = PY_FROM_RE.search(normalized)
+        if from_match:
+            value = from_match.group(1).strip()
+            hints.add(value)
+            hints.add(value.split(".")[-1])
+
+        import_match = PY_IMPORT_RE.search(normalized)
+        if import_match and normalized.startswith("import "):
+            value = import_match.group(1).strip()
+            hints.add(value)
+            hints.add(value.split(".")[-1])
+
+        ts_match = TS_IMPORT_RE.search(normalized)
+        if ts_match:
+            value = ts_match.group(1).strip()
+            hints.add(value)
+            hints.add(value.split("/")[-1])
+
+        java_match = JAVA_IMPORT_RE.search(normalized)
+        if java_match:
+            value = java_match.group(1).strip().rstrip(".*")
+            hints.add(value)
+            hints.add(value.split(".")[-1])
+
+        if normalized.startswith("import ") and '"' in normalized:
+            go_match = GO_IMPORT_RE.search(normalized)
+            if go_match:
+                value = go_match.group(1).strip()
+                hints.add(value)
+                hints.add(value.split("/")[-1])
     return hints
 
 
@@ -113,7 +143,16 @@ def _resolve_targets(
     import_scoped = [
         symbol
         for symbol in matches
-        if any(hint and hint in symbol.qualified_name for hint in import_hints)
+        if any(
+            hint
+            and (
+                hint in symbol.qualified_name
+                or symbol.file_path.endswith(f"/{hint}.py")
+                or symbol.file_path.endswith(f"/{hint}.ts")
+                or symbol.file_path.endswith(f"/{hint}.go")
+            )
+            for hint in import_hints
+        )
     ]
     if import_scoped:
         return import_scoped, 1.0 if len(import_scoped) == 1 else 0.7
@@ -161,4 +200,5 @@ def build_call_edges(
                 )
             )
 
+    edges.sort(key=lambda edge: (edge.line_number or 0, edge.source_id, edge.target_id))
     return edges

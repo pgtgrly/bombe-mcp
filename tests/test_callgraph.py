@@ -104,6 +104,49 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(len(edges), 2)
             self.assertTrue(all(edge.confidence == 0.5 for edge in edges))
 
+    def test_import_scoped_resolution_is_preferred(self) -> None:
+        source = (
+            "from app.auth import util\n"
+            "def caller():\n"
+            "    util()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "entry.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.entry.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                )
+            ]
+            candidates = file_symbols + [
+                SymbolRecord(
+                    name="util",
+                    qualified_name="app.auth.util",
+                    kind="function",
+                    file_path="app/auth.py",
+                    start_line=1,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="util",
+                    qualified_name="pkg.other.util",
+                    kind="function",
+                    file_path="pkg/other.py",
+                    start_line=1,
+                    end_line=2,
+                ),
+            ]
+            edges = build_call_edges(parsed, file_symbols, candidates)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.auth.util"))
+            self.assertEqual(edges[0].confidence, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

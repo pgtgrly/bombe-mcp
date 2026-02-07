@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,7 +31,31 @@ class ParserTests(unittest.TestCase):
                 parsed = parse_file(path, language)
                 self.assertEqual(parsed.language, language)
                 self.assertEqual(parsed.source, source)
-                self.assertIsNone(parsed.tree)
+                if importlib.util.find_spec("tree_sitter_languages") is None:
+                    self.assertIsNone(parsed.tree)
+                else:
+                    self.assertIsNotNone(parsed.tree)
+
+    def test_parse_unsupported_language_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "main.rb"
+            path.write_text("puts 'hi'\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                parse_file(path, "ruby")
+
+    def test_parse_invalid_utf8_uses_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad.py"
+            path.write_bytes(b"def run():\n    return '\\xff'\n")
+            parsed = parse_file(path, "python")
+            self.assertIn("def run", parsed.source)
+
+    def test_parse_python_syntax_error_returns_no_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "broken.py"
+            path.write_text("def bad(:\n    pass\n", encoding="utf-8")
+            parsed = parse_file(path, "python")
+            self.assertIsNone(parsed.tree)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,21 @@
 
 Bombe is a structure-aware code retrieval MCP server for AI coding agents.
 
+## Development Commands
+
+Run all local checks:
+
+```bash
+PYTHONPATH=src python3 -m compileall src tests
+PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"
+```
+
+Run server initialization smoke test:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo . --init-only --log-level INFO
+```
+
 ## Status
 
-Early implementation scaffold.
+Active implementation toward spec-complete MVP.

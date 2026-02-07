@@ -35,6 +35,22 @@ def _build_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Para
     return params
 
 
+def _build_signature(
+    name: str,
+    params: list[ParameterRecord],
+    return_type: str | None,
+) -> str:
+    args = []
+    for param in params:
+        if param.type:
+            args.append(f"{param.name}: {param.type}")
+        else:
+            args.append(param.name)
+    if return_type:
+        return f"def {name}({', '.join(args)}) -> {return_type}"
+    return f"def {name}({', '.join(args)})"
+
+
 def _python_imports(tree: ast.AST, source_path: Path) -> list[ImportRecord]:
     imports: list[ImportRecord] = []
     rel_path = source_path.as_posix()
@@ -51,12 +67,13 @@ def _python_imports(tree: ast.AST, source_path: Path) -> list[ImportRecord]:
                     )
                 )
         if isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
+            prefix = "." * int(getattr(node, "level", 0))
+            module_name = f"{prefix}{node.module or ''}"
             imported_names = [alias.name for alias in node.names]
             imports.append(
                 ImportRecord(
                     source_file_path=rel_path,
-                    import_statement=f"from {module_name} import {', '.join(imported_names)}",
+                    import_statement=f"from {module_name or '.'} import {', '.join(imported_names)}",
                     module_name=module_name,
                     imported_names=imported_names,
                     line_number=node.lineno,
@@ -76,7 +93,9 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
 
     for node in tree.body if isinstance(tree, ast.Module) else []:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            signature = f"def {node.name}({', '.join(arg.arg for arg in node.args.args)})"
+            parameters = _build_parameters(node)
+            return_type = ast.unparse(node.returns) if node.returns else None
+            signature = _build_signature(node.name, parameters, return_type)
             symbols.append(
                 SymbolRecord(
                     name=node.name,
@@ -86,9 +105,11 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
                     start_line=node.lineno,
                     end_line=getattr(node, "end_lineno", node.lineno),
                     signature=signature,
+                    return_type=return_type,
                     visibility=_visibility(node.name),
                     is_async=isinstance(node, ast.AsyncFunctionDef),
-                    parameters=_build_parameters(node),
+                    docstring=ast.get_docstring(node),
+                    parameters=parameters,
                 )
             )
         elif isinstance(node, ast.ClassDef):
@@ -103,11 +124,14 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
                     end_line=getattr(node, "end_lineno", node.lineno),
                     signature=f"class {node.name}",
                     visibility=_visibility(node.name),
+                    docstring=ast.get_docstring(node),
                 )
             )
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    method_signature = f"def {child.name}({', '.join(arg.arg for arg in child.args.args)})"
+                    parameters = _build_parameters(child)
+                    return_type = ast.unparse(child.returns) if child.returns else None
+                    method_signature = _build_signature(child.name, parameters, return_type)
                     symbols.append(
                         SymbolRecord(
                             name=child.name,
@@ -117,9 +141,26 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
                             start_line=child.lineno,
                             end_line=getattr(child, "end_lineno", child.lineno),
                             signature=method_signature,
+                            return_type=return_type,
                             visibility=_visibility(child.name),
                             is_async=isinstance(child, ast.AsyncFunctionDef),
-                            parameters=_build_parameters(child),
+                            docstring=ast.get_docstring(child),
+                            parameters=parameters,
+                        )
+                    )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    symbols.append(
+                        SymbolRecord(
+                            name=target.id,
+                            qualified_name=f"{module}.{target.id}",
+                            kind="constant",
+                            file_path=file_path,
+                            start_line=node.lineno,
+                            end_line=getattr(node, "end_lineno", node.lineno),
+                            signature=target.id,
+                            visibility=_visibility(target.id),
                         )
                     )
 
@@ -130,33 +171,39 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
 JAVA_PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z0-9_.]+)\s*;")
 JAVA_IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.*]+)\s*;")
 JAVA_CLASS_RE = re.compile(
-    r"^\s*(?:public|private|protected)?\s*(?:abstract\s+|final\s+)?(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"^\s*(public|private|protected)?\s*(?:abstract\s+|final\s+)?(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 JAVA_METHOD_RE = re.compile(
-    r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[A-Za-z0-9_<>\[\], ?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{"
+    r"^\s*(public|private|protected)?\s*(static\s+)?(?:final\s+)?([A-Za-z0-9_<>\[\], ?]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{"
 )
 TS_IMPORT_RE = re.compile(r"^\s*import(?:\s+type)?\s+.*?\s+from\s+['\"]([^'\"]+)['\"];?")
 TS_CLASS_RE = re.compile(
     r"^\s*(?:export\s+)?(class|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 TS_FUNCTION_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)"
+    r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([^{]+))?"
 )
 TS_ARROW_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*=>"
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*(?::\s*([^=]+))?\s*=>"
 )
 TS_METHOD_RE = re.compile(
-    r"^\s*(?:public|private|protected)?\s*(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::[^=]+)?\s*\{?"
+    r"^\s*(?:public|private|protected)?\s*(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([^=]+))?\s*\{?"
+)
+TS_CONST_RE = re.compile(
+    r"^\s*(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^=].*;"
 )
 GO_PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)")
 GO_IMPORT_SINGLE_RE = re.compile(r'^\s*import\s+"([^"]+)"')
 GO_IMPORT_BLOCK_START_RE = re.compile(r"^\s*import\s*\(")
 GO_IMPORT_BLOCK_LINE_RE = re.compile(r'^\s*"([^"]+)"')
 GO_TYPE_RE = re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(struct|interface)\b")
-GO_FUNCTION_RE = re.compile(r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)")
-GO_METHOD_RE = re.compile(
-    r"^\s*func\s*\(([^)]*)\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)"
+GO_FUNCTION_RE = re.compile(
+    r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*([A-Za-z0-9_*.\[\]]+)?"
 )
+GO_METHOD_RE = re.compile(
+    r"^\s*func\s*\(([^)]*)\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*([A-Za-z0-9_*.\[\]]+)?"
+)
+GO_CONST_RE = re.compile(r"^\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 
 
 def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRecord]]:
@@ -165,7 +212,7 @@ def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRe
     package_name = ""
     imports: list[ImportRecord] = []
     symbols: list[SymbolRecord] = []
-    class_stack: list[tuple[str, int]] = []
+    class_stack: list[tuple[int, str, int]] = []
 
     for index, line in enumerate(lines, start=1):
         package_match = JAVA_PACKAGE_RE.match(line)
@@ -187,10 +234,12 @@ def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRe
 
         class_match = JAVA_CLASS_RE.match(line)
         if class_match:
-            kind = "interface" if class_match.group(1) == "interface" else "class"
-            class_name = class_match.group(2)
+            visibility = class_match.group(1) or "package"
+            kind = "interface" if class_match.group(2) == "interface" else "class"
+            class_name = class_match.group(3)
             qualified_name = f"{package_name}.{class_name}" if package_name else class_name
-            class_stack.append((class_name, line.count("{") - line.count("}")))
+            symbol_index = len(symbols)
+            class_stack.append((symbol_index, class_name, line.count("{") - line.count("}")))
             symbols.append(
                 SymbolRecord(
                     name=class_name,
@@ -200,17 +249,20 @@ def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRe
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
-                    visibility="public" if "public" in line else "private",
+                    visibility=visibility,
                 )
             )
             continue
 
         method_match = JAVA_METHOD_RE.match(line)
         if method_match and class_stack:
-            method_name = method_match.group(1)
-            params_raw = method_match.group(2).strip()
+            visibility = method_match.group(1) or "package"
+            is_static = bool(method_match.group(2))
+            return_type = method_match.group(3).strip()
+            method_name = method_match.group(4)
+            params_raw = method_match.group(5).strip()
             parameters = _parse_parameters(params_raw, language="java")
-            current_class = class_stack[-1][0]
+            current_class = class_stack[-1][1]
             class_prefix = f"{package_name}.{current_class}" if package_name else current_class
             symbols.append(
                 SymbolRecord(
@@ -221,17 +273,37 @@ def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRe
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
-                    visibility="public" if "public" in line else "private",
+                    return_type=return_type,
+                    visibility=visibility,
+                    is_static=is_static,
                     parameters=parameters,
                 )
             )
 
         if class_stack:
-            class_name, depth = class_stack[-1]
+            symbol_index, class_name, depth = class_stack[-1]
             depth += line.count("{") - line.count("}")
-            class_stack[-1] = (class_name, depth)
-            while class_stack and class_stack[-1][1] <= 0:
-                class_stack.pop()
+            class_stack[-1] = (symbol_index, class_name, depth)
+            while class_stack and class_stack[-1][2] <= 0:
+                finished_index, _, _ = class_stack.pop()
+                finished = symbols[finished_index]
+                symbols[finished_index] = SymbolRecord(
+                    name=finished.name,
+                    qualified_name=finished.qualified_name,
+                    kind=finished.kind,
+                    file_path=finished.file_path,
+                    start_line=finished.start_line,
+                    end_line=index,
+                    signature=finished.signature,
+                    return_type=finished.return_type,
+                    visibility=finished.visibility,
+                    is_async=finished.is_async,
+                    is_static=finished.is_static,
+                    parent_symbol_id=finished.parent_symbol_id,
+                    docstring=finished.docstring,
+                    pagerank_score=finished.pagerank_score,
+                    parameters=finished.parameters,
+                )
 
     return symbols, imports
 
@@ -271,6 +343,13 @@ def _parse_parameters(params_raw: str, language: str) -> list[ParameterRecord]:
                 )
             )
     return parameters
+
+
+def _normalize_type_name(type_name: str | None) -> str | None:
+    if type_name is None:
+        return None
+    normalized = type_name.strip().rstrip(";")
+    return normalized or None
 
 
 def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRecord]]:
@@ -319,6 +398,11 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
         if function_match:
             function_name = function_match.group(1)
             parameters = _parse_parameters(function_match.group(2), language="typescript")
+            return_type = (
+                _normalize_type_name(function_match.group(3))
+                if function_match.group(3) is not None
+                else None
+            )
             symbols.append(
                 SymbolRecord(
                     name=function_name,
@@ -328,6 +412,7 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
+                    return_type=return_type,
                     visibility="public",
                     is_async="async " in line,
                     parameters=parameters,
@@ -339,6 +424,11 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
         if arrow_match:
             function_name = arrow_match.group(1)
             parameters = _parse_parameters(arrow_match.group(2), language="typescript")
+            return_type = (
+                _normalize_type_name(arrow_match.group(3))
+                if arrow_match.group(3) is not None
+                else None
+            )
             symbols.append(
                 SymbolRecord(
                     name=function_name,
@@ -348,6 +438,7 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
+                    return_type=return_type,
                     visibility="public",
                     is_async="async " in line,
                     parameters=parameters,
@@ -360,6 +451,11 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
             method_name = method_match.group(1)
             if method_name != "constructor":
                 parameters = _parse_parameters(method_match.group(2), language="typescript")
+                return_type = (
+                    _normalize_type_name(method_match.group(3))
+                    if method_match.group(3) is not None
+                    else None
+                )
                 current_class = class_stack[-1][0]
                 symbols.append(
                     SymbolRecord(
@@ -370,11 +466,28 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
                         start_line=index,
                         end_line=index,
                         signature=line.strip(),
+                        return_type=return_type,
                         visibility="public",
                         is_async="async " in line,
                         parameters=parameters,
                     )
                 )
+
+        const_match = TS_CONST_RE.match(line)
+        if const_match and "=>" not in line:
+            const_name = const_match.group(1)
+            symbols.append(
+                SymbolRecord(
+                    name=const_name,
+                    qualified_name=f"{module_name}.{const_name}",
+                    kind="constant",
+                    file_path=file_path,
+                    start_line=index,
+                    end_line=index,
+                    signature=line.strip(),
+                    visibility="public",
+                )
+            )
 
         if class_stack:
             class_name, depth = class_stack[-1]
@@ -458,6 +571,7 @@ def _go_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportReco
             receiver_raw = method_match.group(1).strip()
             method_name = method_match.group(2)
             params_raw = method_match.group(3)
+            return_type = method_match.group(4).strip() if method_match.group(4) else None
             receiver_tokens = [token for token in receiver_raw.split(" ") if token]
             receiver_type = receiver_tokens[-1].replace("*", "") if receiver_tokens else "Receiver"
             parameters = _parse_parameters(params_raw, language="go")
@@ -471,6 +585,7 @@ def _go_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportReco
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
+                    return_type=return_type,
                     visibility="public" if method_name[0].isupper() else "private",
                     parameters=parameters,
                 )
@@ -481,6 +596,7 @@ def _go_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportReco
         if function_match:
             function_name = function_match.group(1)
             params_raw = function_match.group(2)
+            return_type = function_match.group(3).strip() if function_match.group(3) else None
             parameters = _parse_parameters(params_raw, language="go")
             qualified = f"{package_name}.{function_name}" if package_name else function_name
             symbols.append(
@@ -492,8 +608,26 @@ def _go_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportReco
                     start_line=index,
                     end_line=index,
                     signature=line.strip(),
+                    return_type=return_type,
                     visibility="public" if function_name[0].isupper() else "private",
                     parameters=parameters,
+                )
+            )
+
+        const_match = GO_CONST_RE.match(line)
+        if const_match:
+            const_name = const_match.group(1)
+            qualified = f"{package_name}.{const_name}" if package_name else const_name
+            symbols.append(
+                SymbolRecord(
+                    name=const_name,
+                    qualified_name=qualified,
+                    kind="constant",
+                    file_path=file_path,
+                    start_line=index,
+                    end_line=index,
+                    signature=line.strip(),
+                    visibility="public" if const_name[0].isupper() else "private",
                 )
             )
 

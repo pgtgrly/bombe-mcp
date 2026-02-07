@@ -14,7 +14,15 @@ authors = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = []
+dev = [
+  "mypy>=1.10.0",
+  "ruff>=0.6.0",
+]
+runtime = [
+  "mcp>=1.0.0",
+  "tree-sitter>=0.22.0",
+  "tree-sitter-languages>=1.10.2",
+]
 
 [project.scripts]
 bombe = "bombe.server:main"
@@ -24,3 +32,14 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_optional = true
