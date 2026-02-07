@@ -62,10 +62,10 @@ def _walk(
     start_id: int,
     direction: str,
     depth: int,
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[int, int, int, str]]:
     queue = deque([(start_id, 0)])
     visited = {start_id}
-    edges: list[tuple[int, int, int]] = []
+    edges: list[tuple[int, int, int, str]] = []
 
     while queue:
         current, current_depth = queue.popleft()
@@ -75,7 +75,7 @@ def _walk(
         if direction == "callers":
             rows = conn.execute(
                 """
-                SELECT source_id AS next_id, line_number
+                SELECT source_id AS next_id, line_number, 'CALLS' AS relationship
                 FROM edges
                 WHERE relationship = 'CALLS'
                   AND target_type = 'symbol'
@@ -86,7 +86,7 @@ def _walk(
         elif direction == "callees":
             rows = conn.execute(
                 """
-                SELECT target_id AS next_id, line_number
+                SELECT target_id AS next_id, line_number, 'CALLS' AS relationship
                 FROM edges
                 WHERE relationship = 'CALLS'
                   AND source_type = 'symbol'
@@ -97,7 +97,7 @@ def _walk(
         elif direction == "implementors":
             rows = conn.execute(
                 """
-                SELECT source_id AS next_id, line_number
+                SELECT source_id AS next_id, line_number, relationship
                 FROM edges
                 WHERE relationship = 'IMPLEMENTS'
                   AND target_type = 'symbol'
@@ -108,7 +108,7 @@ def _walk(
         else:
             rows = conn.execute(
                 """
-                SELECT target_id AS next_id, line_number
+                SELECT target_id AS next_id, line_number, relationship
                 FROM edges
                 WHERE relationship IN ('EXTENDS', 'IMPLEMENTS')
                   AND source_type = 'symbol'
@@ -120,8 +120,9 @@ def _walk(
         for row in rows:
             next_id = int(row["next_id"])
             line_number = int(row["line_number"]) if row["line_number"] is not None else 0
+            relationship = str(row["relationship"])
             next_depth = current_depth + 1
-            edges.append((next_id, line_number, next_depth))
+            edges.append((next_id, line_number, next_depth, relationship))
             if next_id not in visited:
                 visited.add(next_id)
                 queue.append((next_id, next_depth))
@@ -161,13 +162,14 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
         for direction in directions:
             entries = _walk(conn, symbol_id, direction, req.depth)
             results: list[dict[str, object]] = []
-            for next_id, line_number, depth in entries:
+            for next_id, line_number, depth, relationship in entries:
                 info = _load_symbol(conn, next_id)
                 item: dict[str, object] = {
                     "name": info["name"],
                     "file_path": info["file_path"],
                     "line": line_number,
                     "depth": depth,
+                    "reference_reason": f"{direction}:{relationship}:depth={depth}",
                 }
                 if req.include_source:
                     item["source"] = _read_source(

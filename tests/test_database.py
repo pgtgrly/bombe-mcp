@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from bombe.models import FileRecord, ParameterRecord, SymbolRecord
@@ -24,6 +26,10 @@ class DatabaseTests(unittest.TestCase):
             self.assertIn("symbols", table_names)
             self.assertIn("edges", table_names)
             self.assertIn("external_deps", table_names)
+            version = db.query(
+                "SELECT value FROM repo_meta WHERE key = 'schema_version';"
+            )
+            self.assertEqual(version[0]["value"], "2")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -95,6 +101,67 @@ class DatabaseTests(unittest.TestCase):
             symbols = db.query("SELECT file_path FROM symbols;")
             self.assertEqual([row["path"] for row in files], ["src/new.py"])
             self.assertEqual([row["file_path"] for row in symbols], ["src/new.py"])
+
+    def test_init_schema_migrates_schema_version_and_rebuilds_fts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            db.upsert_files(
+                [
+                    FileRecord(
+                        path="src/mod.py",
+                        language="python",
+                        content_hash="hash-1",
+                        size_bytes=10,
+                    )
+                ]
+            )
+            db.replace_file_symbols(
+                file_path="src/mod.py",
+                symbols=[
+                    SymbolRecord(
+                        name="run",
+                        qualified_name="src.mod.run",
+                        kind="function",
+                        file_path="src/mod.py",
+                        start_line=1,
+                        end_line=2,
+                        signature="def run()",
+                        docstring="execute",
+                    )
+                ],
+            )
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO repo_meta(key, value)
+                    VALUES('schema_version', '1')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """
+                )
+                try:
+                    conn.execute("DELETE FROM symbol_fts;")
+                    conn.execute(
+                        """
+                        INSERT INTO symbol_fts(symbol_id, name, qualified_name, docstring, signature)
+                        VALUES (999, 'stale', 'stale', '', '');
+                        """
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                conn.commit()
+
+            db.init_schema()
+            version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
+            self.assertEqual(version[0]["value"], "2")
+            fts_table = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
+            )
+            if fts_table:
+                rows = db.query("SELECT name, qualified_name FROM symbol_fts;")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["name"], "run")
+                self.assertEqual(rows[0]["qualified_name"], "src.mod.run")
 
 
 if __name__ == "__main__":

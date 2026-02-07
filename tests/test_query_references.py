@@ -52,8 +52,10 @@ class QueryReferencesTests(unittest.TestCase):
             callees = response.payload["callees"]
             self.assertEqual(len(callers), 1)
             self.assertEqual(callers[0]["name"], "a")
+            self.assertIn("CALLS", callers[0]["reference_reason"])
             self.assertEqual(len(callees), 1)
             self.assertEqual(callees[0]["name"], "c")
+            self.assertIn("CALLS", callees[0]["reference_reason"])
 
     def test_get_references_supports_implementors_and_supers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -91,6 +93,7 @@ class QueryReferencesTests(unittest.TestCase):
             )
             self.assertEqual(len(impl_response.payload["implementors"]), 1)
             self.assertEqual(impl_response.payload["implementors"][0]["name"], "FileReader")
+            self.assertIn("IMPLEMENTS", impl_response.payload["implementors"][0]["reference_reason"])
 
             super_response = get_references(
                 db,
@@ -98,6 +101,7 @@ class QueryReferencesTests(unittest.TestCase):
             )
             self.assertEqual(len(super_response.payload["supers"]), 1)
             self.assertEqual(super_response.payload["supers"][0]["name"], "Reader")
+            self.assertIn("IMPLEMENTS", super_response.payload["supers"][0]["reference_reason"])
 
 
 if __name__ == "__main__":

@@ -81,17 +81,25 @@ def _search_with_fts(conn, req: SymbolSearchRequest):
 
 def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchResponse:
     with closing(db.connect()) as conn:
+        search_mode = "like"
         try:
             rows = _search_with_fts(conn, req)
+            if rows:
+                search_mode = "fts"
         except Exception:
             rows = []
         if not rows:
             rows = _search_with_like(conn, req)
+            search_mode = "like"
 
         payload: list[dict[str, object]] = []
         for row in rows:
             symbol_id = int(row["id"])
             callers_count, callees_count = _count_refs(conn, symbol_id)
+            file_pattern = req.file_pattern or "*"
+            match_reason = (
+                f"{search_mode}:query='{req.query}',kind='{req.kind}',file='{file_pattern}'"
+            )
             payload.append(
                 {
                     "name": row["name"],
@@ -105,6 +113,8 @@ def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchRespon
                     "importance_score": row["pagerank_score"],
                     "callers_count": callers_count,
                     "callees_count": callees_count,
+                    "match_strategy": search_mode,
+                    "match_reason": match_reason,
                 }
             )
 

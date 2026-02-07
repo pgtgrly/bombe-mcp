@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from bombe.models import EdgeRecord, ParsedUnit, SymbolRecord
 
 
-CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+CALL_RE = re.compile(
+    r"\b(?:([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
 TS_IMPORT_RE = re.compile(r"""import(?:\s+type)?\s+.*?\s+from\s+['"]([^'"]+)['"]""")
 PY_FROM_RE = re.compile(r"""from\s+([A-Za-z0-9_\.]+)\s+import""")
 PY_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_\.]+)""")
@@ -33,6 +35,7 @@ CALL_KEYWORDS = {
 class CallSite:
     callee_name: str
     line_number: int
+    receiver_name: str | None = None
 
 
 def _symbol_id(qualified_name: str) -> int:
@@ -49,12 +52,23 @@ def _extract_python_calls(parsed: ParsedUnit) -> list[CallSite]:
         if not isinstance(node, ast.Call):
             continue
         callee_name = ""
+        receiver_name: str | None = None
         if isinstance(node.func, ast.Name):
             callee_name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             callee_name = node.func.attr
+            if isinstance(node.func.value, ast.Name):
+                receiver_name = node.func.value.id
+            elif isinstance(node.func.value, ast.Attribute):
+                receiver_name = node.func.value.attr
         if callee_name:
-            callsites.append(CallSite(callee_name=callee_name, line_number=node.lineno))
+            callsites.append(
+                CallSite(
+                    callee_name=callee_name,
+                    line_number=node.lineno,
+                    receiver_name=receiver_name,
+                )
+            )
     return callsites
 
 
@@ -62,13 +76,20 @@ def _extract_regex_calls(parsed: ParsedUnit) -> list[CallSite]:
     callsites: list[CallSite] = []
     for index, line in enumerate(parsed.source.splitlines(), start=1):
         for match in CALL_RE.finditer(line):
-            name = match.group(1)
+            receiver = match.group(1)
+            name = match.group(2)
             if name in CALL_KEYWORDS:
                 continue
             prefix = line[: match.start()].strip()
             if prefix.endswith(("def", "function", "func", "class", "new")):
                 continue
-            callsites.append(CallSite(callee_name=name, line_number=index))
+            callsites.append(
+                CallSite(
+                    callee_name=name,
+                    line_number=index,
+                    receiver_name=receiver,
+                )
+            )
     return callsites
 
 
@@ -127,14 +148,26 @@ def _import_hints(source: str) -> set[str]:
 
 
 def _resolve_targets(
-    callee_name: str,
+    callsite: CallSite,
     caller: SymbolRecord,
     candidate_symbols: list[SymbolRecord],
     import_hints: set[str],
 ) -> tuple[list[SymbolRecord], float]:
+    callee_name = callsite.callee_name
     matches = [symbol for symbol in candidate_symbols if symbol.name == callee_name]
     if not matches:
         return [], 0.0
+
+    receiver = (callsite.receiver_name or "").strip().lower()
+    if receiver in {"self", "cls", "this"} and caller.kind == "method":
+        class_prefix = caller.qualified_name.rsplit(".", maxsplit=1)[0]
+        receiver_scoped = [
+            symbol
+            for symbol in matches
+            if symbol.kind == "method" and symbol.qualified_name.startswith(f"{class_prefix}.")
+        ]
+        if receiver_scoped:
+            return receiver_scoped, 1.0 if len(receiver_scoped) == 1 else 0.75
 
     same_file = [symbol for symbol in matches if symbol.file_path == caller.file_path]
     if same_file:
@@ -175,7 +208,7 @@ def build_call_edges(
         if caller is None:
             continue
         targets, confidence = _resolve_targets(
-            callsite.callee_name,
+            callsite,
             caller,
             candidate_symbols,
             hints,

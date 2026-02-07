@@ -74,6 +74,8 @@ class MCPContractTests(unittest.TestCase):
                 "get_context",
                 "get_structure",
                 "get_blast_radius",
+                "trace_data_flow",
+                "change_impact",
             })
             self.assertIsNotNone(fake_server.registered["search_symbols"]["input_schema"])
 
@@ -98,6 +100,16 @@ class MCPContractTests(unittest.TestCase):
                 {"symbol_name": "authenticate", "max_depth": 2}
             )
             self.assertIn("impact", blast_payload)
+
+            data_flow_payload = registry["trace_data_flow"]["handler"](
+                {"symbol_name": "authenticate", "direction": "both", "max_depth": 2}
+            )
+            self.assertIn("paths", data_flow_payload)
+
+            change_impact_payload = registry["change_impact"]["handler"](
+                {"symbol_name": "authenticate", "max_depth": 2}
+            )
+            self.assertIn("impact", change_impact_payload)
 
 
 if __name__ == "__main__":

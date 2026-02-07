@@ -2,6 +2,20 @@
 
 Bombe is a structure-aware code retrieval MCP server for AI coding agents.
 
+## Installation
+
+Install runtime dependencies and package:
+
+```bash
+python3 -m pip install .
+```
+
+Install with development tooling:
+
+```bash
+python3 -m pip install ".[dev]"
+```
+
 ## Development Commands
 
 Run all local checks:

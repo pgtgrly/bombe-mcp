@@ -167,6 +167,65 @@ def _personalized_pagerank(
     return scores
 
 
+def _adjacency(conn, nodes: list[int]) -> dict[int, set[int]]:
+    if not nodes:
+        return {}
+    rel_placeholders = ", ".join("?" for _ in RELATIONSHIPS)
+    node_set = set(nodes)
+    adjacency: dict[int, set[int]] = {node: set() for node in nodes}
+    rows = conn.execute(
+        f"""
+        SELECT source_id, target_id
+        FROM edges
+        WHERE source_type = 'symbol'
+          AND target_type = 'symbol'
+          AND relationship IN ({rel_placeholders});
+        """,
+        RELATIONSHIPS,
+    ).fetchall()
+    for row in rows:
+        source = int(row["source_id"])
+        target = int(row["target_id"])
+        if source in node_set and target in node_set:
+            adjacency[source].add(target)
+            adjacency[target].add(source)
+    return adjacency
+
+
+def _topology_order(
+    ranked: list[tuple[float, dict[str, object]]],
+    seeds: list[int],
+    adjacency: dict[int, set[int]],
+) -> list[tuple[int, str]]:
+    score_map = {int(symbol["id"]): score for score, symbol in ranked}
+    seed_ids = sorted(set(seeds), key=lambda symbol_id: score_map.get(symbol_id, 0.0), reverse=True)
+    queue = deque((seed_id, "seed") for seed_id in seed_ids)
+    ordered: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
+    while queue:
+        current, reason = queue.popleft()
+        if current in seen:
+            continue
+        seen.add(current)
+        ordered.append((current, reason))
+        neighbors = sorted(
+            adjacency.get(current, set()),
+            key=lambda symbol_id: score_map.get(symbol_id, 0.0),
+            reverse=True,
+        )
+        for neighbor in neighbors:
+            if neighbor not in seen:
+                queue.append((neighbor, "graph_neighbor"))
+
+    remaining = [
+        (int(symbol["id"]), "rank_fallback")
+        for _, symbol in ranked
+        if int(symbol["id"]) not in seen
+    ]
+    return ordered + remaining
+
+
 def get_context(db: Database, req: ContextRequest) -> ContextResponse:
     with closing(db.connect()) as conn:
         seeds = _pick_seeds(conn, req)
@@ -224,10 +283,14 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 )
             )
         ranked.sort(key=lambda item: item[0], reverse=True)
+        adjacency = _adjacency(conn, list(symbol_ids))
+        topology_order = _topology_order(ranked, seeds, adjacency)
+        ranked_symbols = {int(symbol["id"]): symbol for _, symbol in ranked}
 
         tokens_used = 0
         included_symbols: list[dict[str, object]] = []
-        for _, symbol in ranked:
+        for symbol_id, topology_reason in topology_order:
+            symbol = ranked_symbols[symbol_id]
             include_full = bool(symbol["is_seed"]) and not req.include_signatures_only
             source = ""
             mode = "signature_only"
@@ -249,6 +312,9 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 if tokens_used + symbol_tokens > req.token_budget:
                     continue
             tokens_used += symbol_tokens
+            reason_parts = [topology_reason, f"depth={symbol['depth']}", f"mode={mode}"]
+            if symbol["is_seed"]:
+                reason_parts.append("seed_match")
             included_symbols.append(
                 {
                     "id": symbol["id"],
@@ -260,6 +326,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                     "file_path": symbol["file_path"],
                     "depth": symbol["depth"],
                     "qualified_name": symbol["qualified_name"],
+                    "selection_reason": ",".join(reason_parts),
                 }
             )
 
@@ -280,6 +347,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             "context_bundle": {
                 "summary": summary,
                 "relationship_map": relationship_map,
+                "selection_strategy": "seeded_topology_then_rank",
                 "files": file_entries,
                 "tokens_used": tokens_used,
                 "token_budget": req.token_budget,

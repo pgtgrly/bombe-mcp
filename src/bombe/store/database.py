@@ -10,6 +10,8 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
+SCHEMA_VERSION = 2
+
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS repo_meta (
@@ -121,7 +123,69 @@ class Database:
                     conn.execute(statement)
                 except sqlite3.OperationalError:
                     continue
+            self._migrate_schema(conn)
             conn.commit()
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        current_version = self._get_schema_version(conn)
+        if current_version >= SCHEMA_VERSION:
+            return
+        if current_version < 2:
+            self._migrate_to_v2(conn)
+        self._set_schema_version(conn, SCHEMA_VERSION)
+
+    def _migrate_to_v2(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute("SELECT 1 FROM symbol_fts LIMIT 1;")
+        except sqlite3.OperationalError:
+            return
+        conn.execute("DELETE FROM symbol_fts;")
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                name,
+                qualified_name,
+                COALESCE(docstring, '') AS docstring,
+                COALESCE(signature, '') AS signature
+            FROM symbols;
+            """
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO symbol_fts(symbol_id, name, qualified_name, docstring, signature)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    int(row["id"]),
+                    row["name"],
+                    row["qualified_name"],
+                    row["docstring"],
+                    row["signature"],
+                ),
+            )
+
+    def _get_schema_version(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT value FROM repo_meta WHERE key = 'schema_version';"
+        ).fetchone()
+        if not row:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _set_schema_version(self, conn: sqlite3.Connection, version: int) -> None:
+        conn.execute(
+            """
+            INSERT INTO repo_meta(key, value)
+            VALUES('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            (str(version),),
+        )
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:

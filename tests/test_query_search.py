@@ -58,6 +58,8 @@ class QuerySearchTests(unittest.TestCase):
             symbol = result.symbols[0]
             self.assertEqual(symbol["name"], "authenticate")
             self.assertEqual(symbol["callers_count"], 1)
+            self.assertEqual(symbol["match_strategy"], "like")
+            self.assertIn("query='auth'", symbol["match_reason"])
 
     def test_search_symbols_uses_fts_content_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -102,6 +104,7 @@ class QuerySearchTests(unittest.TestCase):
             if fts_available:
                 self.assertEqual(result.total_matches, 1)
                 self.assertEqual(result.symbols[0]["name"], "verify_password")
+                self.assertEqual(result.symbols[0]["match_strategy"], "fts")
             else:
                 self.assertGreaterEqual(result.total_matches, 0)
 

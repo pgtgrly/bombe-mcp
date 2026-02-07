@@ -12,7 +12,9 @@ from bombe.models import (
     SymbolSearchRequest,
 )
 from bombe.query.blast import get_blast_radius
+from bombe.query.change_impact import change_impact
 from bombe.query.context import get_context
+from bombe.query.data_flow import trace_data_flow
 from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.query.structure import get_structure
@@ -82,6 +84,32 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["symbol_name"],
     },
+    "trace_data_flow": {
+        "type": "object",
+        "properties": {
+            "symbol_name": {"type": "string"},
+            "direction": {
+                "type": "string",
+                "enum": ["upstream", "downstream", "both"],
+                "default": "both",
+            },
+            "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
+        },
+        "required": ["symbol_name"],
+    },
+    "change_impact": {
+        "type": "object",
+        "properties": {
+            "symbol_name": {"type": "string"},
+            "change_type": {
+                "type": "string",
+                "enum": ["signature", "behavior", "delete"],
+                "default": "behavior",
+            },
+            "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
+        },
+        "required": ["symbol_name"],
+    },
 }
 
 
@@ -148,6 +176,24 @@ def _blast_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     return response.payload
 
 
+def _data_flow_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    return trace_data_flow(
+        db,
+        symbol_name=str(payload["symbol_name"]),
+        direction=str(payload.get("direction", "both")),
+        max_depth=int(payload.get("max_depth", 3)),
+    )
+
+
+def _change_impact_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    return change_impact(
+        db,
+        symbol_name=str(payload["symbol_name"]),
+        change_type=str(payload.get("change_type", "behavior")),
+        max_depth=int(payload.get("max_depth", 3)),
+    )
+
+
 def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
     del repo_root
     return {
@@ -175,6 +221,16 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
             "description": "Analyze impact of changing a symbol.",
             "input_schema": TOOL_SCHEMAS["get_blast_radius"],
             "handler": lambda payload: _blast_handler(db, payload),
+        },
+        "trace_data_flow": {
+            "description": "Trace upstream and downstream callgraph data flow for a symbol.",
+            "input_schema": TOOL_SCHEMAS["trace_data_flow"],
+            "handler": lambda payload: _data_flow_handler(db, payload),
+        },
+        "change_impact": {
+            "description": "Estimate change impact with callgraph and type-dependency analysis.",
+            "input_schema": TOOL_SCHEMAS["change_impact"],
+            "handler": lambda payload: _change_impact_handler(db, payload),
         },
     }
 

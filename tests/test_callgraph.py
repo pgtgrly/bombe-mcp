@@ -147,6 +147,52 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(edges[0].target_id, symbol_id("app.auth.util"))
             self.assertEqual(edges[0].confidence, 1.0)
 
+    def test_self_receiver_prefers_method_on_same_class(self) -> None:
+        source = (
+            "class Service:\n"
+            "    def caller(self):\n"
+            "        self.render()\n"
+            "    def render(self):\n"
+            "        return 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.Service.caller",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                ),
+                SymbolRecord(
+                    name="render",
+                    qualified_name="app.service.Service.render",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=4,
+                    end_line=5,
+                ),
+            ]
+            candidates = file_symbols + [
+                SymbolRecord(
+                    name="render",
+                    qualified_name="pkg.other.render",
+                    kind="function",
+                    file_path="pkg/other.py",
+                    start_line=1,
+                    end_line=2,
+                )
+            ]
+
+            edges = build_call_edges(parsed, file_symbols, candidates)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.service.Service.render"))
+            self.assertEqual(edges[0].confidence, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
