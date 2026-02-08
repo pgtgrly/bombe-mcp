@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 
+from bombe.query.guards import MAX_GRAPH_EDGES, MAX_GRAPH_VISITED, MAX_IMPACT_DEPTH, clamp_depth, truncate_query
 from bombe.store.database import Database
 
 
@@ -36,10 +37,12 @@ def change_impact(
     change_type: str = "behavior",
     max_depth: int = 3,
 ) -> dict[str, object]:
+    normalized_symbol = truncate_query(symbol_name)
+    bounded_depth = clamp_depth(max_depth, maximum=MAX_IMPACT_DEPTH)
     with closing(db.connect()) as conn:
-        target = _resolve_symbol(conn, symbol_name)
+        target = _resolve_symbol(conn, normalized_symbol)
         if target is None:
-            raise ValueError(f"Symbol not found: {symbol_name}")
+            raise ValueError(f"Symbol not found: {normalized_symbol}")
 
         target_id = int(target["id"])
         queue = deque([(target_id, 0)])
@@ -48,8 +51,10 @@ def change_impact(
         transitive_callers: list[dict[str, object]] = []
 
         while queue:
+            if len(direct_callers) + len(transitive_callers) >= MAX_GRAPH_EDGES:
+                break
             current, depth = queue.popleft()
-            if depth >= max_depth:
+            if depth >= bounded_depth:
                 continue
             rows = conn.execute(
                 """
@@ -63,9 +68,13 @@ def change_impact(
                 (current,),
             ).fetchall()
             for row in rows:
+                if len(direct_callers) + len(transitive_callers) >= MAX_GRAPH_EDGES:
+                    break
                 source_id = int(row["source_id"])
                 if source_id in visited:
                     continue
+                if len(visited) >= MAX_GRAPH_VISITED:
+                    break
                 visited.add(source_id)
                 next_depth = depth + 1
                 item = {
@@ -126,7 +135,7 @@ def change_impact(
                 "file_path": target["file_path"],
             },
             "change_type": change_type,
-            "max_depth": max_depth,
+            "max_depth": bounded_depth,
             "summary": summary,
             "impact": {
                 "direct_callers": direct_callers,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 
+from bombe.query.guards import MAX_FLOW_DEPTH, MAX_GRAPH_EDGES, MAX_GRAPH_VISITED, clamp_depth, truncate_query
 from bombe.store.database import Database
 
 
@@ -27,10 +28,12 @@ def trace_data_flow(
     direction: str = "both",
     max_depth: int = 3,
 ) -> dict[str, object]:
+    normalized_symbol = truncate_query(symbol_name)
+    bounded_depth = clamp_depth(max_depth, maximum=MAX_FLOW_DEPTH)
     with closing(db.connect()) as conn:
-        target = _resolve_symbol(conn, symbol_name)
+        target = _resolve_symbol(conn, normalized_symbol)
         if target is None:
-            raise ValueError(f"Symbol not found: {symbol_name}")
+            raise ValueError(f"Symbol not found: {normalized_symbol}")
 
         target_id = int(target["id"])
         queue = deque([(target_id, 0, "target")])
@@ -47,8 +50,10 @@ def trace_data_flow(
         }
 
         while queue:
+            if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+                break
             current_id, depth, _role = queue.popleft()
-            if depth >= max_depth:
+            if depth >= bounded_depth:
                 continue
             current_name = str(nodes.get(current_id, {}).get("name", ""))
 
@@ -65,6 +70,8 @@ def trace_data_flow(
                     (current_id,),
                 ).fetchall()
                 for row in upstream_rows:
+                    if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+                        break
                     neighbor_id = int(row["neighbor_id"])
                     nodes.setdefault(
                         neighbor_id,
@@ -105,6 +112,8 @@ def trace_data_flow(
                     (current_id,),
                 ).fetchall()
                 for row in downstream_rows:
+                    if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+                        break
                     neighbor_id = int(row["neighbor_id"])
                     nodes.setdefault(
                         neighbor_id,
@@ -139,7 +148,7 @@ def trace_data_flow(
         node_list = sorted(nodes.values(), key=lambda item: (str(item["file_path"]), str(item["name"])))
         summary = (
             f"Traced {len(sorted_paths)} call edges across {len(node_list)} symbols "
-            f"(direction={direction}, depth<={max_depth})."
+            f"(direction={direction}, depth<={bounded_depth})."
         )
         return {
             "target": {
@@ -149,7 +158,7 @@ def trace_data_flow(
                 "file_path": target["file_path"],
             },
             "direction": direction,
-            "max_depth": max_depth,
+            "max_depth": bounded_depth,
             "summary": summary,
             "nodes": node_list,
             "paths": sorted_paths,

@@ -185,6 +185,16 @@ class MCPContractTests(unittest.TestCase):
                 },
             )
 
+            metric_rows = db.query(
+                """
+                SELECT tool_name, success
+                FROM tool_metrics
+                ORDER BY id;
+                """
+            )
+            self.assertGreaterEqual(len(metric_rows), 7)
+            self.assertTrue(all(int(row["success"]) == 1 for row in metric_rows))
+
 
 if __name__ == "__main__":
     unittest.main()

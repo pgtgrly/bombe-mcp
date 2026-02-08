@@ -29,7 +29,7 @@ class DatabaseTests(unittest.TestCase):
             version = db.query(
                 "SELECT value FROM repo_meta WHERE key = 'schema_version';"
             )
-            self.assertEqual(version[0]["value"], "3")
+            self.assertEqual(version[0]["value"], "4")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,7 +153,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "3")
+            self.assertEqual(version[0]["value"], "4")
             fts_table = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
             )
@@ -163,7 +163,7 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(rows[0]["name"], "run")
                 self.assertEqual(rows[0]["qualified_name"], "src.mod.run")
 
-    def test_init_schema_migrates_from_v2_to_v3_indexes(self) -> None:
+    def test_init_schema_migrates_from_v3_to_v4_state_tables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(Path(tmpdir) / "bombe.db")
             db.init_schema()
@@ -171,20 +171,104 @@ class DatabaseTests(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT INTO repo_meta(key, value)
-                    VALUES('schema_version', '2')
+                    VALUES('schema_version', '3')
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                     """
                 )
-                conn.execute("DROP INDEX IF EXISTS idx_edges_file_line;")
+                conn.execute("DROP TABLE IF EXISTS sync_queue;")
                 conn.commit()
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "3")
-            index_rows = db.query(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_edges_file_line';"
+            self.assertEqual(version[0]["value"], "4")
+            table_rows = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_queue';"
             )
-            self.assertEqual(len(index_rows), 1)
+            self.assertEqual(len(table_rows), 1)
+            migration_rows = db.query(
+                """
+                SELECT from_version, to_version, status
+                FROM migration_history
+                WHERE to_version = 4
+                ORDER BY id DESC
+                LIMIT 1;
+                """
+            )
+            self.assertEqual(len(migration_rows), 1)
+            self.assertEqual(int(migration_rows[0]["from_version"]), 3)
+            self.assertEqual(str(migration_rows[0]["status"]), "success")
+
+    def test_backup_and_restore_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = Database(tmp / "bombe.db")
+            db.init_schema()
+            db.upsert_files(
+                [
+                    FileRecord(
+                        path="src/main.py",
+                        language="python",
+                        content_hash="hash-1",
+                        size_bytes=10,
+                    )
+                ]
+            )
+            backup = db.backup_to(tmp / "backup" / "bombe-backup.db")
+
+            db.delete_file_graph("src/main.py")
+            rows_after_delete = db.query("SELECT COUNT(*) AS count FROM files;")
+            self.assertEqual(int(rows_after_delete[0]["count"]), 0)
+
+            db.restore_from(backup)
+            rows_after_restore = db.query("SELECT COUNT(*) AS count FROM files;")
+            self.assertEqual(int(rows_after_restore[0]["count"]), 1)
+
+    def test_sync_state_and_metrics_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            queue_id = db.enqueue_sync_delta("repo", "snap_1", '{"delta":"ok"}')
+            pending = db.list_pending_sync_deltas("repo", limit=5)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(int(pending[0]["id"]), queue_id)
+
+            db.mark_sync_delta_status(queue_id, status="pushed", last_error=None)
+            pushed_rows = db.query(
+                "SELECT status, attempt_count FROM sync_queue WHERE id = ?;",
+                (queue_id,),
+            )
+            self.assertEqual(str(pushed_rows[0]["status"]), "pushed")
+            self.assertEqual(int(pushed_rows[0]["attempt_count"]), 1)
+
+            db.set_artifact_pin("repo", "snap_1", "artifact_1")
+            self.assertEqual(db.get_artifact_pin("repo", "snap_1"), "artifact_1")
+
+            db.quarantine_artifact("artifact_bad", "checksum_mismatch")
+            self.assertTrue(db.is_artifact_quarantined("artifact_bad"))
+
+            db.set_circuit_breaker_state("repo", state="open", failure_count=3, opened_at_utc="2026-01-01T00:00:00Z")
+            breaker = db.get_circuit_breaker_state("repo")
+            self.assertIsNotNone(breaker)
+            self.assertEqual(breaker["state"], "open")
+            self.assertEqual(int(breaker["failure_count"]), 3)
+
+            db.record_sync_event("repo", "INFO", "sync_cycle", {"mode": "hybrid"})
+            event_rows = db.query("SELECT event_type FROM sync_events ORDER BY id DESC LIMIT 1;")
+            self.assertEqual(str(event_rows[0]["event_type"]), "sync_cycle")
+
+            db.record_tool_metric(
+                tool_name="search_symbols",
+                latency_ms=12.5,
+                success=True,
+                mode="local",
+                repo_id="repo",
+                result_size=3,
+                error_message=None,
+            )
+            metrics = db.recent_tool_metrics("search_symbols", limit=1)
+            self.assertEqual(len(metrics), 1)
+            self.assertEqual(str(metrics[0]["tool_name"]), "search_symbols")
+            self.assertEqual(int(metrics[0]["result_size"]), 3)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,14 @@ class ArtifactQuarantineStore:
                 quarantined_at_utc=datetime.now(timezone.utc).isoformat(),
             )
 
+    def preload(self, artifact_id: str, reason: str, quarantined_at_utc: str | None = None) -> None:
+        with self._lock:
+            self._records[artifact_id] = QuarantineRecord(
+                artifact_id=artifact_id,
+                reason=reason,
+                quarantined_at_utc=quarantined_at_utc or datetime.now(timezone.utc).isoformat(),
+            )
+
     def is_quarantined(self, artifact_id: str) -> bool:
         with self._lock:
             return artifact_id in self._records
@@ -96,8 +104,43 @@ class CircuitBreaker:
         self.reset_timeout_seconds = max(0.01, reset_timeout_seconds)
         self._failure_count = 0
         self._opened_at_monotonic = 0.0
+        self._opened_at_utc: str | None = None
         self._state = "closed"
         self._lock = threading.Lock()
+
+    @classmethod
+    def from_persisted(
+        cls,
+        state: str,
+        failure_count: int,
+        opened_at_utc: str | None,
+        failure_threshold: int = 3,
+        reset_timeout_seconds: float = 10.0,
+    ) -> "CircuitBreaker":
+        breaker = cls(
+            failure_threshold=failure_threshold,
+            reset_timeout_seconds=reset_timeout_seconds,
+        )
+        normalized_state = state if state in {"closed", "open", "half_open"} else "closed"
+        breaker._state = normalized_state
+        breaker._failure_count = max(0, int(failure_count))
+        breaker._opened_at_utc = opened_at_utc
+        if normalized_state == "open":
+            if opened_at_utc:
+                age = cls._age_seconds(opened_at_utc)
+                breaker._opened_at_monotonic = time.monotonic() - max(age, 0.0)
+            else:
+                breaker._opened_at_monotonic = time.monotonic()
+        return breaker
+
+    @staticmethod
+    def _age_seconds(opened_at_utc: str) -> float:
+        normalized = opened_at_utc.replace("Z", "+00:00")
+        opened_at = datetime.fromisoformat(normalized)
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        return max(0.0, (now_utc - opened_at).total_seconds())
 
     def state(self) -> str:
         with self._lock:
@@ -118,6 +161,7 @@ class CircuitBreaker:
             self._failure_count = 0
             self._state = "closed"
             self._opened_at_monotonic = 0.0
+            self._opened_at_utc = None
 
     def record_failure(self) -> None:
         with self._lock:
@@ -128,6 +172,15 @@ class CircuitBreaker:
             if self._failure_count >= self.failure_threshold:
                 self._state = "open"
                 self._opened_at_monotonic = time.monotonic()
+                self._opened_at_utc = datetime.now(timezone.utc).isoformat()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self._state,
+                "failure_count": self._failure_count,
+                "opened_at_utc": self._opened_at_utc,
+            }
 
 
 class CompatibilityPolicy:
@@ -193,6 +246,9 @@ class SyncClient:
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def circuit_state(self) -> dict[str, Any]:
+        return self.circuit_breaker.snapshot()
 
     def push_delta(self, delta: IndexDelta) -> SyncResult:
         compatible, reason = self.policy.evaluate_delta(delta)

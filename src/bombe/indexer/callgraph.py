@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import zlib
+from collections import defaultdict
 from dataclasses import dataclass
 
 from bombe.models import EdgeRecord, ParsedUnit, SymbolRecord
@@ -46,6 +47,14 @@ class CallSite:
     callee_name: str
     line_number: int
     receiver_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ReceiverHintBlock:
+    caller_name: str
+    start_line: int
+    end_line: int
+    receiver_types: dict[str, set[str]]
 
 
 def _symbol_id(qualified_name: str) -> int:
@@ -107,6 +116,141 @@ def _extract_calls(parsed: ParsedUnit) -> list[CallSite]:
     if parsed.language == "python":
         return _extract_python_calls(parsed)
     return _extract_regex_calls(parsed)
+
+
+def _annotation_type_name(annotation: ast.AST | None) -> str | None:
+    if annotation is None:
+        return None
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr
+    if isinstance(annotation, ast.Subscript):
+        slice_value = annotation.slice
+        if isinstance(slice_value, ast.Tuple):
+            for item in slice_value.elts:
+                resolved = _annotation_type_name(item)
+                if resolved:
+                    return resolved
+        else:
+            resolved = _annotation_type_name(slice_value)
+            if resolved:
+                return resolved
+        return _annotation_type_name(annotation.value)
+    return None
+
+
+def _call_type_name(node: ast.AST | None) -> str | None:
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def _record_receiver_type(receiver_types: dict[str, set[str]], target: ast.AST, type_name: str) -> None:
+    if isinstance(target, ast.Name):
+        receiver_types.setdefault(target.id, set()).add(type_name)
+        return
+    if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+        receiver_key = f"{target.value.id}.{target.attr}"
+        receiver_types.setdefault(receiver_key, set()).add(type_name)
+        if target.value.id == "self":
+            receiver_types.setdefault(target.attr, set()).add(type_name)
+
+
+def _collect_receiver_types(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, set[str]]:
+    receiver_types: dict[str, set[str]] = defaultdict(set)
+    for arg in function_node.args.args:
+        type_name = _annotation_type_name(arg.annotation)
+        if type_name:
+            receiver_types[arg.arg].add(type_name)
+
+    for node in ast.walk(function_node):
+        if isinstance(node, ast.Assign):
+            type_name = _call_type_name(node.value)
+            if not type_name:
+                continue
+            for target in node.targets:
+                _record_receiver_type(receiver_types, target, type_name)
+        elif isinstance(node, ast.AnnAssign):
+            type_name = _annotation_type_name(node.annotation) or _call_type_name(node.value)
+            if type_name:
+                _record_receiver_type(receiver_types, node.target, type_name)
+    return {name: set(values) for name, values in receiver_types.items()}
+
+
+def _python_receiver_hint_blocks(parsed: ParsedUnit) -> list[ReceiverHintBlock]:
+    tree = parsed.tree
+    if not isinstance(tree, ast.Module):
+        return []
+    blocks: list[ReceiverHintBlock] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            blocks.append(
+                ReceiverHintBlock(
+                    caller_name=node.name,
+                    start_line=node.lineno,
+                    end_line=getattr(node, "end_lineno", node.lineno),
+                    receiver_types=_collect_receiver_types(node),
+                )
+            )
+        elif isinstance(node, ast.ClassDef):
+            class_member_types: dict[str, set[str]] = defaultdict(set)
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__":
+                    init_hints = _collect_receiver_types(child)
+                    for key, values in init_hints.items():
+                        normalized_key = key.split(".", maxsplit=1)[-1] if "." in key else key
+                        class_member_types[normalized_key].update(values)
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    receiver_types = _collect_receiver_types(child)
+                    if child.name != "__init__":
+                        for key, values in class_member_types.items():
+                            receiver_types.setdefault(key, set()).update(values)
+                    blocks.append(
+                        ReceiverHintBlock(
+                            caller_name=child.name,
+                            start_line=child.lineno,
+                            end_line=getattr(child, "end_lineno", child.lineno),
+                            receiver_types=receiver_types,
+                        )
+                    )
+    return blocks
+
+
+def _receiver_types_for_call(
+    caller: SymbolRecord,
+    callsite: CallSite,
+    blocks: list[ReceiverHintBlock],
+) -> set[str]:
+    receiver_name = (callsite.receiver_name or "").strip()
+    if not receiver_name:
+        return set()
+    best_block: ReceiverHintBlock | None = None
+    for block in blocks:
+        if block.caller_name != caller.name:
+            continue
+        if not (block.start_line <= callsite.line_number <= block.end_line):
+            continue
+        if best_block is None:
+            best_block = block
+            continue
+        current_span = best_block.end_line - best_block.start_line
+        next_span = block.end_line - block.start_line
+        if next_span < current_span:
+            best_block = block
+    if best_block is None:
+        return set()
+
+    hints = set(best_block.receiver_types.get(receiver_name, set()))
+    hints.update(best_block.receiver_types.get(f"self.{receiver_name}", set()))
+    return hints
 
 
 def _caller_for_line(line_number: int, file_symbols: list[SymbolRecord]) -> SymbolRecord | None:
@@ -211,6 +355,7 @@ def _resolve_targets(
     candidate_symbols: list[SymbolRecord],
     import_hints: set[str],
     alias_hints: dict[str, set[str]],
+    receiver_type_hints: set[str],
 ) -> tuple[list[SymbolRecord], float]:
     callee_name = callsite.callee_name
     candidate_names = {callee_name}
@@ -230,7 +375,30 @@ def _resolve_targets(
         if class_scoped and receiver in {"", "self", "cls", "this"}:
             return class_scoped, 1.0 if len(class_scoped) == 1 else 0.78
 
+    if receiver_type_hints:
+        typed_matches = []
+        for symbol in matches:
+            if symbol.kind != "method":
+                continue
+            parts = symbol.qualified_name.split(".")
+            owner = parts[-2] if len(parts) >= 2 else ""
+            if owner in receiver_type_hints:
+                typed_matches.append(symbol)
+        if typed_matches:
+            return typed_matches, 1.0 if len(typed_matches) == 1 else 0.82
+
     if receiver and receiver not in {"self", "cls", "this"}:
+        class_receiver = []
+        for symbol in matches:
+            if symbol.kind != "method":
+                continue
+            parts = symbol.qualified_name.split(".")
+            owner = parts[-2] if len(parts) >= 2 else ""
+            if owner == receiver:
+                class_receiver.append(symbol)
+        if class_receiver:
+            return class_receiver, 1.0 if len(class_receiver) == 1 else 0.79
+
         receiver_scoped = [
             symbol
             for symbol in matches
@@ -272,6 +440,7 @@ def build_call_edges(
     callsites = _extract_calls(parsed)
     hints = _import_hints(parsed.source)
     alias_hints = _import_aliases(parsed.source)
+    receiver_hint_blocks = _python_receiver_hint_blocks(parsed) if parsed.language == "python" else []
     edges: list[EdgeRecord] = []
     seen: set[tuple[int, int, int]] = set()
 
@@ -285,6 +454,7 @@ def build_call_edges(
             candidate_symbols,
             hints,
             alias_hints,
+            _receiver_types_for_call(caller, callsite, receiver_hint_blocks),
         )
         for target in targets:
             if symbol_id_lookup is None:

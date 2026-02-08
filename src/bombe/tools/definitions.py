@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Callable
 
 from bombe.models import (
@@ -10,6 +12,22 @@ from bombe.models import (
     ReferenceRequest,
     StructureRequest,
     SymbolSearchRequest,
+)
+from bombe.query.guards import (
+    MAX_CONTEXT_EXPANSION_DEPTH,
+    MAX_CONTEXT_SEEDS,
+    MAX_CONTEXT_TOKEN_BUDGET,
+    MAX_FLOW_DEPTH,
+    MAX_IMPACT_DEPTH,
+    MAX_REFERENCE_DEPTH,
+    MAX_SEARCH_LIMIT,
+    MAX_STRUCTURE_TOKEN_BUDGET,
+    MIN_CONTEXT_TOKEN_BUDGET,
+    MIN_STRUCTURE_TOKEN_BUDGET,
+    clamp_budget,
+    clamp_depth,
+    clamp_limit,
+    truncate_query,
 )
 from bombe.query.blast import get_blast_radius
 from bombe.query.change_impact import change_impact
@@ -113,14 +131,78 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+def _result_size(payload: dict[str, Any] | str) -> int | None:
+    if isinstance(payload, str):
+        return len(payload)
+    size = 0
+    for value in payload.values():
+        if isinstance(value, list):
+            size += len(value)
+        elif isinstance(value, dict):
+            size += len(value.keys())
+        elif value is not None:
+            size += 1
+    return size
+
+
+def _safe_record_tool_metric(db: Database, **metric_kwargs: Any) -> None:
+    try:
+        db.record_tool_metric(**metric_kwargs)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to persist tool metric for %s: %s",
+            metric_kwargs.get("tool_name", "unknown_tool"),
+            str(exc),
+        )
+
+
+def _instrument_handler(
+    db: Database,
+    tool_name: str,
+    handler: ToolHandler,
+) -> ToolHandler:
+    def wrapped(payload: dict[str, Any]) -> dict[str, Any] | str:
+        started = time.perf_counter()
+        try:
+            result = handler(payload)
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            _safe_record_tool_metric(
+                db,
+                tool_name=tool_name,
+                latency_ms=latency_ms,
+                success=True,
+                mode="local",
+                repo_id=None,
+                result_size=_result_size(result),
+                error_message=None,
+            )
+            return result
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            _safe_record_tool_metric(
+                db,
+                tool_name=tool_name,
+                latency_ms=latency_ms,
+                success=False,
+                mode="local",
+                repo_id=None,
+                result_size=None,
+                error_message=str(exc),
+            )
+            logging.getLogger(__name__).exception("Tool handler failed: %s", tool_name)
+            raise
+
+    return wrapped
+
+
 def _search_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     response = search_symbols(
         db,
         SymbolSearchRequest(
-            query=str(payload["query"]),
+            query=truncate_query(str(payload["query"])),
             kind=str(payload.get("kind", "any")),
             file_pattern=payload.get("file_pattern"),
-            limit=int(payload.get("limit", 20)),
+            limit=clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT),
         ),
     )
     return {"symbols": response.symbols, "total_matches": response.total_matches}
@@ -130,9 +212,9 @@ def _references_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]
     response = get_references(
         db,
         ReferenceRequest(
-            symbol_name=str(payload["symbol_name"]),
+            symbol_name=truncate_query(str(payload["symbol_name"])),
             direction=str(payload.get("direction", "both")),
-            depth=int(payload.get("depth", 1)),
+            depth=clamp_depth(int(payload.get("depth", 1)), maximum=MAX_REFERENCE_DEPTH),
             include_source=bool(payload.get("include_source", False)),
         ),
     )
@@ -140,14 +222,22 @@ def _references_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]
 
 
 def _context_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    entry_points = list(payload.get("entry_points", []))[:MAX_CONTEXT_SEEDS]
     response = get_context(
         db,
         ContextRequest(
-            query=str(payload["query"]),
-            entry_points=list(payload.get("entry_points", [])),
-            token_budget=int(payload.get("token_budget", 8000)),
+            query=truncate_query(str(payload["query"])),
+            entry_points=entry_points,
+            token_budget=clamp_budget(
+                int(payload.get("token_budget", 8000)),
+                minimum=MIN_CONTEXT_TOKEN_BUDGET,
+                maximum=MAX_CONTEXT_TOKEN_BUDGET,
+            ),
             include_signatures_only=bool(payload.get("include_signatures_only", False)),
-            expansion_depth=int(payload.get("expansion_depth", 2)),
+            expansion_depth=clamp_depth(
+                int(payload.get("expansion_depth", 2)),
+                maximum=MAX_CONTEXT_EXPANSION_DEPTH,
+            ),
         ),
     )
     return response.payload
@@ -158,7 +248,11 @@ def _structure_handler(db: Database, payload: dict[str, Any]) -> str:
         db,
         StructureRequest(
             path=str(payload.get("path", ".")),
-            token_budget=int(payload.get("token_budget", 4000)),
+            token_budget=clamp_budget(
+                int(payload.get("token_budget", 4000)),
+                minimum=MIN_STRUCTURE_TOKEN_BUDGET,
+                maximum=MAX_STRUCTURE_TOKEN_BUDGET,
+            ),
             include_signatures=bool(payload.get("include_signatures", True)),
         ),
     )
@@ -168,9 +262,9 @@ def _blast_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     response = get_blast_radius(
         db,
         BlastRadiusRequest(
-            symbol_name=str(payload["symbol_name"]),
+            symbol_name=truncate_query(str(payload["symbol_name"])),
             change_type=str(payload.get("change_type", "behavior")),
-            max_depth=int(payload.get("max_depth", 3)),
+            max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_IMPACT_DEPTH),
         ),
     )
     return response.payload
@@ -179,58 +273,75 @@ def _blast_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
 def _data_flow_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     return trace_data_flow(
         db,
-        symbol_name=str(payload["symbol_name"]),
+        symbol_name=truncate_query(str(payload["symbol_name"])),
         direction=str(payload.get("direction", "both")),
-        max_depth=int(payload.get("max_depth", 3)),
+        max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_FLOW_DEPTH),
     )
 
 
 def _change_impact_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     return change_impact(
         db,
-        symbol_name=str(payload["symbol_name"]),
+        symbol_name=truncate_query(str(payload["symbol_name"])),
         change_type=str(payload.get("change_type", "behavior")),
-        max_depth=int(payload.get("max_depth", 3)),
+        max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_IMPACT_DEPTH),
     )
 
 
 def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
     del repo_root
+    search_handler = _instrument_handler(db, "search_symbols", lambda payload: _search_handler(db, payload))
+    references_handler = _instrument_handler(
+        db, "get_references", lambda payload: _references_handler(db, payload)
+    )
+    context_handler = _instrument_handler(db, "get_context", lambda payload: _context_handler(db, payload))
+    structure_handler = _instrument_handler(
+        db, "get_structure", lambda payload: _structure_handler(db, payload)
+    )
+    blast_handler = _instrument_handler(
+        db, "get_blast_radius", lambda payload: _blast_handler(db, payload)
+    )
+    data_flow_handler = _instrument_handler(
+        db, "trace_data_flow", lambda payload: _data_flow_handler(db, payload)
+    )
+    impact_handler = _instrument_handler(
+        db, "change_impact", lambda payload: _change_impact_handler(db, payload)
+    )
     return {
         "search_symbols": {
             "description": "Search for symbols by name, kind, and file path.",
             "input_schema": TOOL_SCHEMAS["search_symbols"],
-            "handler": lambda payload: _search_handler(db, payload),
+            "handler": search_handler,
         },
         "get_references": {
             "description": "Find callers/callees for a symbol.",
             "input_schema": TOOL_SCHEMAS["get_references"],
-            "handler": lambda payload: _references_handler(db, payload),
+            "handler": references_handler,
         },
         "get_context": {
             "description": "Assemble query-specific context within a token budget.",
             "input_schema": TOOL_SCHEMAS["get_context"],
-            "handler": lambda payload: _context_handler(db, payload),
+            "handler": context_handler,
         },
         "get_structure": {
             "description": "Return ranked repository structure map.",
             "input_schema": TOOL_SCHEMAS["get_structure"],
-            "handler": lambda payload: _structure_handler(db, payload),
+            "handler": structure_handler,
         },
         "get_blast_radius": {
             "description": "Analyze impact of changing a symbol.",
             "input_schema": TOOL_SCHEMAS["get_blast_radius"],
-            "handler": lambda payload: _blast_handler(db, payload),
+            "handler": blast_handler,
         },
         "trace_data_flow": {
             "description": "Trace upstream and downstream callgraph data flow for a symbol.",
             "input_schema": TOOL_SCHEMAS["trace_data_flow"],
-            "handler": lambda payload: _data_flow_handler(db, payload),
+            "handler": data_flow_handler,
         },
         "change_impact": {
             "description": "Estimate change impact with callgraph and type-dependency analysis.",
             "input_schema": TOOL_SCHEMAS["change_impact"],
-            "handler": lambda payload: _change_impact_handler(db, payload),
+            "handler": impact_handler,
         },
     }
 

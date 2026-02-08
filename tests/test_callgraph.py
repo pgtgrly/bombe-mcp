@@ -327,6 +327,100 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(edges[0].source_id, 101)
             self.assertEqual(edges[0].target_id, 202)
 
+    def test_receiver_type_hint_from_local_instantiation_prefers_method_owner(self) -> None:
+        source = (
+            "class AuthService:\n"
+            "    def validate(self):\n"
+            "        return True\n"
+            "\n"
+            "class AuditService:\n"
+            "    def validate(self):\n"
+            "        return False\n"
+            "\n"
+            "def caller():\n"
+            "    svc = AuthService()\n"
+            "    return svc.validate()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=9,
+                    end_line=11,
+                ),
+                SymbolRecord(
+                    name="validate",
+                    qualified_name="app.service.AuthService.validate",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                ),
+                SymbolRecord(
+                    name="validate",
+                    qualified_name="app.service.AuditService.validate",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=6,
+                    end_line=7,
+                ),
+            ]
+            edges = build_call_edges(parsed, file_symbols, file_symbols)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.service.AuthService.validate"))
+
+    def test_receiver_type_hint_from_self_member_assignment_prefers_member_type(self) -> None:
+        source = (
+            "class Client:\n"
+            "    def run(self):\n"
+            "        return 1\n"
+            "\n"
+            "class Service:\n"
+            "    def __init__(self):\n"
+            "        self.client = Client()\n"
+            "    def caller(self):\n"
+            "        return self.client.run()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.Service.caller",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=8,
+                    end_line=9,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.Client.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.Other.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=12,
+                    end_line=13,
+                ),
+            ]
+            edges = build_call_edges(parsed, file_symbols, file_symbols)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.service.Client.run"))
+
 
 if __name__ == "__main__":
     unittest.main()

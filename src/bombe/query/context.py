@@ -7,6 +7,16 @@ from contextlib import closing
 from pathlib import Path
 
 from bombe.models import ContextRequest, ContextResponse
+from bombe.query.guards import (
+    MAX_CONTEXT_EXPANSION_DEPTH,
+    MAX_CONTEXT_SEEDS,
+    MAX_CONTEXT_TOKEN_BUDGET,
+    MAX_GRAPH_VISITED,
+    MIN_CONTEXT_TOKEN_BUDGET,
+    clamp_budget,
+    clamp_depth,
+    truncate_query,
+)
 from bombe.store.database import Database
 
 
@@ -89,12 +99,14 @@ def _pick_seeds(conn, req: ContextRequest) -> list[int]:
     return [int(row["id"]) for row in rows]
 
 
-def _expand(conn, seeds: list[int], depth: int) -> dict[int, int]:
+def _expand(conn, seeds: list[int], depth: int, max_nodes: int = MAX_GRAPH_VISITED) -> dict[int, int]:
     reached: dict[int, int] = {seed: 0 for seed in seeds}
     queue = deque((seed, 0) for seed in seeds)
     rel_placeholders = ", ".join("?" for _ in RELATIONSHIPS)
 
     while queue:
+        if len(reached) >= max_nodes:
+            break
         current, current_depth = queue.popleft()
         if current_depth >= depth:
             continue
@@ -115,7 +127,8 @@ def _expand(conn, seeds: list[int], depth: int) -> dict[int, int]:
             previous = reached.get(neighbor)
             if previous is None or next_depth < previous:
                 reached[neighbor] = next_depth
-                queue.append((neighbor, next_depth))
+                if len(reached) < max_nodes:
+                    queue.append((neighbor, next_depth))
     return reached
 
 
@@ -272,25 +285,41 @@ def _quality_metrics(
 
 
 def get_context(db: Database, req: ContextRequest) -> ContextResponse:
+    normalized_request = ContextRequest(
+        query=truncate_query(req.query),
+        entry_points=req.entry_points[:MAX_CONTEXT_SEEDS],
+        token_budget=clamp_budget(
+            req.token_budget,
+            minimum=MIN_CONTEXT_TOKEN_BUDGET,
+            maximum=MAX_CONTEXT_TOKEN_BUDGET,
+        ),
+        include_signatures_only=req.include_signatures_only,
+        expansion_depth=clamp_depth(req.expansion_depth, maximum=MAX_CONTEXT_EXPANSION_DEPTH),
+    )
     with closing(db.connect()) as conn:
-        seeds = _pick_seeds(conn, req)
+        seeds = _pick_seeds(conn, normalized_request)
         if not seeds:
             return ContextResponse(
                 payload={
-                    "query": req.query,
+                    "query": normalized_request.query,
                     "context_bundle": {
                         "summary": "No relevant symbols found.",
                         "relationship_map": "",
                         "files": [],
                         "tokens_used": 0,
-                        "token_budget": req.token_budget,
+                        "token_budget": normalized_request.token_budget,
                         "symbols_included": 0,
                         "symbols_available": 0,
                     },
                 }
             )
 
-        reached = _expand(conn, seeds, req.expansion_depth)
+        reached = _expand(
+            conn,
+            seeds,
+            normalized_request.expansion_depth,
+            max_nodes=MAX_GRAPH_VISITED,
+        )
         symbol_ids = tuple(reached.keys())
         placeholders = ", ".join("?" for _ in symbol_ids)
         ppr_scores = _personalized_pagerank(conn, seeds, list(symbol_ids))
@@ -335,8 +364,10 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         tokens_used = 0
         included_symbols: list[dict[str, object]] = []
         for symbol_id, topology_reason in topology_order:
+            if len(included_symbols) >= MAX_GRAPH_VISITED:
+                break
             symbol = ranked_symbols[symbol_id]
-            include_full = bool(symbol["is_seed"]) and not req.include_signatures_only
+            include_full = bool(symbol["is_seed"]) and not normalized_request.include_signatures_only
             source = ""
             mode = "signature_only"
             if include_full:
@@ -349,12 +380,12 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             if not include_full:
                 source = str(symbol["signature"])
             symbol_tokens = _approx_tokens(source)
-            if tokens_used + symbol_tokens > req.token_budget:
+            if tokens_used + symbol_tokens > normalized_request.token_budget:
                 if mode == "full_source":
                     source = str(symbol["signature"])
                     mode = "signature_only"
                     symbol_tokens = _approx_tokens(source)
-                if tokens_used + symbol_tokens > req.token_budget:
+                if tokens_used + symbol_tokens > normalized_request.token_budget:
                     continue
             tokens_used += symbol_tokens
             reason_parts = [topology_reason, f"depth={symbol['depth']}", f"mode={mode}"]
@@ -389,13 +420,13 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         quality_metrics = _quality_metrics(
             included_symbols=included_symbols,
             seeds=seeds,
-            token_budget=req.token_budget,
+            token_budget=normalized_request.token_budget,
             tokens_used=tokens_used,
             adjacency=adjacency,
         )
 
         payload = {
-            "query": req.query,
+            "query": normalized_request.query,
             "context_bundle": {
                 "summary": summary,
                 "relationship_map": relationship_map,
@@ -403,7 +434,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 "quality_metrics": quality_metrics,
                 "files": file_entries,
                 "tokens_used": tokens_used,
-                "token_budget": req.token_budget,
+                "token_budget": normalized_request.token_budget,
                 "symbols_included": len(included_symbols),
                 "symbols_available": len(ranked),
             },

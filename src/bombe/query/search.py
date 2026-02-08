@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 
+from bombe.query.guards import MAX_SEARCH_LIMIT, clamp_limit, truncate_query
 from bombe.models import SymbolSearchRequest, SymbolSearchResponse
 from bombe.store.database import Database
 
@@ -80,25 +81,31 @@ def _search_with_fts(conn, req: SymbolSearchRequest):
 
 
 def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchResponse:
+    normalized_request = SymbolSearchRequest(
+        query=truncate_query(req.query),
+        kind=req.kind,
+        file_pattern=req.file_pattern,
+        limit=clamp_limit(req.limit, maximum=MAX_SEARCH_LIMIT),
+    )
     with closing(db.connect()) as conn:
         search_mode = "like"
         try:
-            rows = _search_with_fts(conn, req)
+            rows = _search_with_fts(conn, normalized_request)
             if rows:
                 search_mode = "fts"
         except Exception:
             rows = []
         if not rows:
-            rows = _search_with_like(conn, req)
+            rows = _search_with_like(conn, normalized_request)
             search_mode = "like"
 
         payload: list[dict[str, object]] = []
         for row in rows:
             symbol_id = int(row["id"])
             callers_count, callees_count = _count_refs(conn, symbol_id)
-            file_pattern = req.file_pattern or "*"
+            file_pattern = normalized_request.file_pattern or "*"
             match_reason = (
-                f"{search_mode}:query='{req.query}',kind='{req.kind}',file='{file_pattern}'"
+                f"{search_mode}:query='{normalized_request.query}',kind='{normalized_request.kind}',file='{file_pattern}'"
             )
             payload.append(
                 {

@@ -7,6 +7,13 @@ from contextlib import closing
 from pathlib import Path
 
 from bombe.models import ReferenceRequest, ReferenceResponse
+from bombe.query.guards import (
+    MAX_GRAPH_EDGES,
+    MAX_GRAPH_VISITED,
+    MAX_REFERENCE_DEPTH,
+    clamp_depth,
+    truncate_query,
+)
 from bombe.store.database import Database
 
 
@@ -62,12 +69,16 @@ def _walk(
     start_id: int,
     direction: str,
     depth: int,
+    max_edges: int = MAX_GRAPH_EDGES,
+    max_visited: int = MAX_GRAPH_VISITED,
 ) -> list[tuple[int, int, int, str]]:
     queue = deque([(start_id, 0)])
     visited = {start_id}
     edges: list[tuple[int, int, int, str]] = []
 
     while queue:
+        if len(edges) >= max_edges or len(visited) >= max_visited:
+            break
         current, current_depth = queue.popleft()
         if current_depth >= depth:
             continue
@@ -118,12 +129,14 @@ def _walk(
             ).fetchall()
 
         for row in rows:
+            if len(edges) >= max_edges:
+                break
             next_id = int(row["next_id"])
             line_number = int(row["line_number"]) if row["line_number"] is not None else 0
             relationship = str(row["relationship"])
             next_depth = current_depth + 1
             edges.append((next_id, line_number, next_depth, relationship))
-            if next_id not in visited:
+            if next_id not in visited and len(visited) < max_visited:
                 visited.add(next_id)
                 queue.append((next_id, next_depth))
 
@@ -131,10 +144,12 @@ def _walk(
 
 
 def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
+    normalized_symbol = truncate_query(req.symbol_name)
+    bounded_depth = clamp_depth(req.depth, maximum=MAX_REFERENCE_DEPTH)
     with closing(db.connect()) as conn:
-        symbol_id = _resolve_symbol_id(conn, req.symbol_name)
+        symbol_id = _resolve_symbol_id(conn, normalized_symbol)
         if symbol_id is None:
-            raise ValueError(f"Symbol not found: {req.symbol_name}")
+            raise ValueError(f"Symbol not found: {normalized_symbol}")
 
         target = _load_symbol(conn, symbol_id)
         payload: dict[str, object] = {
@@ -160,7 +175,7 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
             directions.append("supers")
 
         for direction in directions:
-            entries = _walk(conn, symbol_id, direction, req.depth)
+            entries = _walk(conn, symbol_id, direction, bounded_depth)
             results: list[dict[str, object]] = []
             for next_id, line_number, depth, relationship in entries:
                 info = _load_symbol(conn, next_id)

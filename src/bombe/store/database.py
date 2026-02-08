@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_STATEMENTS = (
     """
@@ -82,6 +83,76 @@ SCHEMA_STATEMENTS = (
         line_number INTEGER
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS migration_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_version INTEGER NOT NULL,
+        to_version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sync_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id TEXT NOT NULL,
+        local_snapshot TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS artifact_quarantine (
+        artifact_id TEXT PRIMARY KEY,
+        reason TEXT NOT NULL,
+        quarantined_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS artifact_pins (
+        repo_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        artifact_id TEXT NOT NULL,
+        pinned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(repo_id, snapshot_id)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS circuit_breakers (
+        repo_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        opened_at_utc TEXT
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sync_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id TEXT NOT NULL,
+        level TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        detail_json TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tool_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id TEXT,
+        tool_name TEXT NOT NULL,
+        latency_ms REAL NOT NULL,
+        success INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        result_size INTEGER,
+        error_message TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
     "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);",
@@ -92,6 +163,9 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_edges_relationship ON edges(relationship);",
     "CREATE INDEX IF NOT EXISTS idx_edges_file_line ON edges(file_path, line_number);",
     "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);",
+    "CREATE INDEX IF NOT EXISTS idx_sync_queue_repo_status ON sync_queue(repo_id, status, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_sync_events_repo_created ON sync_events(repo_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_tool_metrics_tool_created ON tool_metrics(tool_name, created_at);",
 )
 
 FTS_STATEMENTS = (
@@ -131,14 +205,37 @@ class Database:
         current_version = self._get_schema_version(conn)
         while current_version < SCHEMA_VERSION:
             next_version = current_version + 1
-            if next_version == 1:
-                self._migrate_to_v1(conn)
-            elif next_version == 2:
-                self._migrate_to_v2(conn)
-            elif next_version == 3:
-                self._migrate_to_v3(conn)
-            self._set_schema_version(conn, next_version)
-            current_version = next_version
+            conn.execute("SAVEPOINT bombe_migrate_step;")
+            try:
+                if next_version == 1:
+                    self._migrate_to_v1(conn)
+                elif next_version == 2:
+                    self._migrate_to_v2(conn)
+                elif next_version == 3:
+                    self._migrate_to_v3(conn)
+                elif next_version == 4:
+                    self._migrate_to_v4(conn)
+                self._set_schema_version(conn, next_version)
+                self._record_migration_step(
+                    conn=conn,
+                    from_version=current_version,
+                    to_version=next_version,
+                    status="success",
+                    error_message=None,
+                )
+                conn.execute("RELEASE SAVEPOINT bombe_migrate_step;")
+                current_version = next_version
+            except Exception as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT bombe_migrate_step;")
+                conn.execute("RELEASE SAVEPOINT bombe_migrate_step;")
+                self._record_migration_step(
+                    conn=conn,
+                    from_version=current_version,
+                    to_version=next_version,
+                    status="failed",
+                    error_message=str(exc),
+                )
+                raise
 
     def _migrate_to_v1(self, conn: sqlite3.Connection) -> None:
         del conn
@@ -180,6 +277,101 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_edges_file_line ON edges(file_path, line_number);"
         )
 
+    def _migrate_to_v4(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_version INTEGER NOT NULL,
+                to_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT NOT NULL,
+                local_snapshot TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifact_quarantine (
+                artifact_id TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                quarantined_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifact_pins (
+                repo_id TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                pinned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(repo_id, snapshot_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS circuit_breakers (
+                repo_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                opened_at_utc TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT NOT NULL,
+                level TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail_json TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT,
+                tool_name TEXT NOT NULL,
+                latency_ms REAL NOT NULL,
+                success INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                result_size INTEGER,
+                error_message TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_queue_repo_status ON sync_queue(repo_id, status, created_at);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_events_repo_created ON sync_events(repo_id, created_at);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_metrics_tool_created ON tool_metrics(tool_name, created_at);"
+        )
+
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         row = conn.execute(
             "SELECT value FROM repo_meta WHERE key = 'schema_version';"
@@ -201,10 +393,26 @@ class Database:
             (str(version),),
         )
 
-    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    def _record_migration_step(
+        self,
+        conn: sqlite3.Connection,
+        from_version: int,
+        to_version: int,
+        status: str,
+        error_message: str | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO migration_history(from_version, to_version, status, error_message)
+            VALUES (?, ?, ?, ?);
+            """,
+            (from_version, to_version, status, error_message),
+        )
+
+    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with closing(self.connect()) as conn:
             cursor = conn.execute(sql, params)
-            return list(cursor.fetchall())
+            return [dict(row) for row in cursor.fetchall()]
 
     def upsert_files(self, records: Sequence[FileRecord]) -> None:
         if not records:
@@ -402,3 +610,219 @@ class Database:
             conn.execute("UPDATE external_deps SET file_path = ? WHERE file_path = ?;", (new_path, old_path))
             conn.execute("DELETE FROM files WHERE path = ?;", (old_path,))
             conn.commit()
+
+    def backup_to(self, destination: Path) -> Path:
+        backup_path = destination.expanduser().resolve()
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self.connect()) as source_conn:
+            with closing(sqlite3.connect(backup_path)) as backup_conn:
+                source_conn.backup(backup_conn)
+                backup_conn.commit()
+        return backup_path
+
+    def restore_from(self, source: Path) -> None:
+        source_path = source.expanduser().resolve()
+        if not source_path.exists():
+            raise FileNotFoundError(f"Backup file does not exist: {source_path}")
+        with closing(sqlite3.connect(source_path)) as source_conn:
+            with closing(self.connect()) as target_conn:
+                source_conn.backup(target_conn)
+                target_conn.commit()
+
+    def enqueue_sync_delta(self, repo_id: str, local_snapshot: str, payload_json: str) -> int:
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO sync_queue(repo_id, local_snapshot, payload_json, status)
+                VALUES (?, ?, ?, 'queued');
+                """,
+                (repo_id, local_snapshot, payload_json),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_pending_sync_deltas(self, repo_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.query(
+            """
+            SELECT id, repo_id, local_snapshot, payload_json, status, attempt_count, last_error, created_at, updated_at
+            FROM sync_queue
+            WHERE repo_id = ? AND status IN ('queued', 'retry')
+            ORDER BY created_at ASC
+            LIMIT ?;
+            """,
+            (repo_id, max(1, limit)),
+        )
+
+    def mark_sync_delta_status(self, queue_id: int, status: str, last_error: str | None = None) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE sync_queue
+                SET
+                    status = ?,
+                    last_error = ?,
+                    attempt_count = attempt_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?;
+                """,
+                (status, last_error, queue_id),
+            )
+            conn.commit()
+
+    def set_artifact_pin(self, repo_id: str, snapshot_id: str, artifact_id: str) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO artifact_pins(repo_id, snapshot_id, artifact_id, pinned_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(repo_id, snapshot_id) DO UPDATE SET
+                    artifact_id = excluded.artifact_id,
+                    pinned_at = excluded.pinned_at;
+                """,
+                (repo_id, snapshot_id, artifact_id),
+            )
+            conn.commit()
+
+    def get_artifact_pin(self, repo_id: str, snapshot_id: str) -> str | None:
+        rows = self.query(
+            """
+            SELECT artifact_id
+            FROM artifact_pins
+            WHERE repo_id = ? AND snapshot_id = ?
+            LIMIT 1;
+            """,
+            (repo_id, snapshot_id),
+        )
+        if not rows:
+            return None
+        return str(rows[0]["artifact_id"])
+
+    def quarantine_artifact(self, artifact_id: str, reason: str) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO artifact_quarantine(artifact_id, reason, quarantined_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                    reason = excluded.reason,
+                    quarantined_at = excluded.quarantined_at;
+                """,
+                (artifact_id, reason),
+            )
+            conn.commit()
+
+    def is_artifact_quarantined(self, artifact_id: str) -> bool:
+        rows = self.query(
+            "SELECT artifact_id FROM artifact_quarantine WHERE artifact_id = ? LIMIT 1;",
+            (artifact_id,),
+        )
+        return bool(rows)
+
+    def list_quarantined_artifacts(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.query(
+            """
+            SELECT artifact_id, reason, quarantined_at
+            FROM artifact_quarantine
+            ORDER BY quarantined_at DESC
+            LIMIT ?;
+            """,
+            (max(1, limit),),
+        )
+
+    def set_circuit_breaker_state(
+        self,
+        repo_id: str,
+        state: str,
+        failure_count: int,
+        opened_at_utc: str | None,
+    ) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO circuit_breakers(repo_id, state, failure_count, opened_at_utc)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET
+                    state = excluded.state,
+                    failure_count = excluded.failure_count,
+                    opened_at_utc = excluded.opened_at_utc;
+                """,
+                (repo_id, state, max(0, failure_count), opened_at_utc),
+            )
+            conn.commit()
+
+    def get_circuit_breaker_state(self, repo_id: str) -> dict[str, Any] | None:
+        rows = self.query(
+            """
+            SELECT state, failure_count, opened_at_utc
+            FROM circuit_breakers
+            WHERE repo_id = ?
+            LIMIT 1;
+            """,
+            (repo_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "state": str(row["state"]),
+            "failure_count": int(row["failure_count"]),
+            "opened_at_utc": row["opened_at_utc"],
+        }
+
+    def record_sync_event(
+        self,
+        repo_id: str,
+        level: str,
+        event_type: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        detail_json = json.dumps(detail, sort_keys=True) if detail is not None else None
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO sync_events(repo_id, level, event_type, detail_json)
+                VALUES (?, ?, ?, ?);
+                """,
+                (repo_id, level, event_type, detail_json),
+            )
+            conn.commit()
+
+    def record_tool_metric(
+        self,
+        tool_name: str,
+        latency_ms: float,
+        success: bool,
+        mode: str,
+        repo_id: str | None = None,
+        result_size: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_metrics(repo_id, tool_name, latency_ms, success, mode, result_size, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    repo_id,
+                    tool_name,
+                    float(latency_ms),
+                    int(bool(success)),
+                    mode,
+                    result_size,
+                    error_message,
+                ),
+            )
+            conn.commit()
+
+    def recent_tool_metrics(self, tool_name: str, limit: int = 50) -> list[dict[str, Any]]:
+        return self.query(
+            """
+            SELECT repo_id, tool_name, latency_ms, success, mode, result_size, error_message, created_at
+            FROM tool_metrics
+            WHERE tool_name = ?
+            ORDER BY created_at DESC
+            LIMIT ?;
+            """,
+            (tool_name, max(1, limit)),
+        )

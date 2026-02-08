@@ -1,0 +1,38 @@
+"""Shared guardrails for query payload bounds and traversal limits."""
+
+from __future__ import annotations
+
+MAX_QUERY_LENGTH = 512
+MAX_SEARCH_LIMIT = 100
+MAX_REFERENCE_DEPTH = 6
+MAX_FLOW_DEPTH = 6
+MAX_IMPACT_DEPTH = 6
+MAX_CONTEXT_TOKEN_BUDGET = 32000
+MIN_CONTEXT_TOKEN_BUDGET = 1
+MAX_CONTEXT_EXPANSION_DEPTH = 4
+MAX_STRUCTURE_TOKEN_BUDGET = 32000
+MIN_STRUCTURE_TOKEN_BUDGET = 1
+MAX_GRAPH_VISITED = 2000
+MAX_GRAPH_EDGES = 5000
+MAX_CONTEXT_SEEDS = 32
+
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def clamp_depth(value: int, *, maximum: int) -> int:
+    return clamp_int(value, 1, maximum)
+
+
+def clamp_budget(value: int, *, minimum: int, maximum: int) -> int:
+    return clamp_int(value, minimum, maximum)
+
+
+def clamp_limit(value: int, *, maximum: int) -> int:
+    return clamp_int(value, 1, maximum)
+
+
+def truncate_query(query: str) -> str:
+    stripped = query.strip()
+    return stripped[:MAX_QUERY_LENGTH]
