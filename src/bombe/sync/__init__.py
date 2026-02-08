@@ -1,0 +1,27 @@
+"""Sync modules for hybrid local/control-plane operation."""
+
+from bombe.sync.client import (
+    ArtifactQuarantineStore,
+    CircuitBreaker,
+    CompatibilityPolicy,
+    PullResult,
+    SyncClient,
+    SyncResult,
+    build_artifact_checksum,
+    validate_artifact_checksum,
+)
+from bombe.sync.reconcile import PromotionResult, promote_delta, reconcile_artifact
+
+__all__ = [
+    "ArtifactQuarantineStore",
+    "CircuitBreaker",
+    "CompatibilityPolicy",
+    "PullResult",
+    "SyncClient",
+    "SyncResult",
+    "build_artifact_checksum",
+    "validate_artifact_checksum",
+    "PromotionResult",
+    "promote_delta",
+    "reconcile_artifact",
+]

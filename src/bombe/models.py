@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+DELTA_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 1
+MCP_CONTRACT_VERSION = 1
+
+
+def _signature_hash(signature: str | None) -> str:
+    return hashlib.sha256((signature or "").encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,69 @@ class SymbolRecord:
 
 
 @dataclass(frozen=True)
+class SymbolKey:
+    qualified_name: str
+    file_path: str
+    start_line: int
+    end_line: int
+    signature_hash: str
+
+    @classmethod
+    def from_symbol(cls, symbol: SymbolRecord) -> "SymbolKey":
+        return cls.from_fields(
+            qualified_name=symbol.qualified_name,
+            file_path=symbol.file_path,
+            start_line=symbol.start_line,
+            end_line=symbol.end_line,
+            signature=symbol.signature,
+        )
+
+    @classmethod
+    def from_fields(
+        cls,
+        qualified_name: str,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        signature: str | None,
+    ) -> "SymbolKey":
+        return cls(
+            qualified_name=qualified_name,
+            file_path=file_path,
+            start_line=start_line,
+            end_line=end_line,
+            signature_hash=_signature_hash(signature),
+        )
+
+    def as_tuple(self) -> tuple[str, str, int, int, str]:
+        return (
+            self.qualified_name,
+            self.file_path,
+            self.start_line,
+            self.end_line,
+            self.signature_hash,
+        )
+
+
+@dataclass(frozen=True)
+class EdgeKey:
+    source: SymbolKey
+    target: SymbolKey
+    relationship: str
+    line_number: int
+
+    def as_tuple(
+        self,
+    ) -> tuple[tuple[str, str, int, int, str], tuple[str, str, int, int, str], str, int]:
+        return (
+            self.source.as_tuple(),
+            self.target.as_tuple(),
+            self.relationship,
+            self.line_number,
+        )
+
+
+@dataclass(frozen=True)
 class EdgeRecord:
     source_id: int
     target_id: int
@@ -52,6 +124,29 @@ class EdgeRecord:
     file_path: str | None = None
     line_number: int | None = None
     confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class EdgeContractRecord:
+    source: SymbolKey
+    target: SymbolKey
+    relationship: str
+    line_number: int
+    confidence: float = 1.0
+    provenance: str = "local"
+
+    def key(self) -> EdgeKey:
+        return EdgeKey(
+            source=self.source,
+            target=self.target,
+            relationship=self.relationship,
+            line_number=self.line_number,
+        )
+
+    def as_tuple(
+        self,
+    ) -> tuple[tuple[str, str, int, int, str], tuple[str, str, int, int, str], str, int]:
+        return self.key().as_tuple()
 
 
 @dataclass(frozen=True)
@@ -84,6 +179,59 @@ class FileChange:
     status: str
     path: str
     old_path: str | None = None
+
+
+@dataclass(frozen=True)
+class FileDelta:
+    status: str
+    path: str
+    old_path: str | None = None
+    content_hash: str | None = None
+    size_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class DeltaHeader:
+    repo_id: str
+    parent_snapshot: str | None
+    local_snapshot: str
+    tool_version: str
+    schema_version: int
+    created_at_utc: str
+
+
+@dataclass(frozen=True)
+class QualityStats:
+    ambiguity_rate: float = 0.0
+    unresolved_imports: int = 0
+    parse_failures: int = 0
+
+
+@dataclass(frozen=True)
+class IndexDelta:
+    header: DeltaHeader
+    file_changes: list[FileDelta] = field(default_factory=list)
+    symbol_upserts: list[SymbolRecord] = field(default_factory=list)
+    symbol_deletes: list[SymbolKey] = field(default_factory=list)
+    edge_upserts: list[EdgeContractRecord] = field(default_factory=list)
+    edge_deletes: list[EdgeContractRecord] = field(default_factory=list)
+    quality_stats: QualityStats = field(default_factory=QualityStats)
+
+
+@dataclass(frozen=True)
+class ArtifactBundle:
+    artifact_id: str
+    repo_id: str
+    snapshot_id: str
+    parent_snapshot: str | None
+    tool_version: str
+    schema_version: int
+    created_at_utc: str
+    promoted_symbols: list[SymbolKey] = field(default_factory=list)
+    promoted_edges: list[EdgeContractRecord] = field(default_factory=list)
+    impact_priors: list[dict[str, Any]] = field(default_factory=list)
+    flow_hints: list[dict[str, Any]] = field(default_factory=list)
+    checksum: str | None = None
 
 
 @dataclass(frozen=True)

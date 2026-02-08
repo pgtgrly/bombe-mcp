@@ -34,3 +34,20 @@ jobs:
         run: PYTHONPATH=src python3 -W error -m coverage run -m unittest discover -s tests -p "test_*.py"
       - name: Coverage threshold
         run: python3 -m coverage report --fail-under=90
+
+  release-gates:
+    runs-on: ubuntu-latest
+    env:
+      BOMBE_RUN_PERF: "1"
+      BOMBE_PERF_HISTORY: /tmp/bombe-perf-ci.jsonl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python3 -m pip install -e ".[dev]"
+      - name: Perf suites
+        run: PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v
+      - name: Evaluate release gates
+        run: PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-ci.jsonl
