@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -224,6 +225,7 @@ def run_sync_cycle(
     transport: Any,
     changes: list[FileChange],
     timeout_seconds: float = 0.5,
+    signing_key: str | None = None,
 ) -> SyncCycleReport:
     delta = _build_delta(repo_root, db, changes)
     repo_identifier = delta.header.repo_id
@@ -250,12 +252,14 @@ def run_sync_cycle(
         )
 
     policy = CompatibilityPolicy(tool_version=__version__)
+    resolved_signing_key = signing_key or os.getenv("BOMBE_SYNC_SIGNING_KEY")
     client = SyncClient(
         transport=transport,
         policy=policy,
         timeout_seconds=max(0.01, timeout_seconds),
         circuit_breaker=breaker,
         quarantine_store=quarantine_store,
+        signing_key=resolved_signing_key,
     )
     try:
         queue_payload = json.dumps(asdict(delta), sort_keys=True)

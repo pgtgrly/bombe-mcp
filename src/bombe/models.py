@@ -232,6 +232,7 @@ class ArtifactBundle:
     impact_priors: list[dict[str, Any]] = field(default_factory=list)
     flow_hints: list[dict[str, Any]] = field(default_factory=list)
     checksum: str | None = None
+    signature: str | None = None
 
 
 @dataclass(frozen=True)

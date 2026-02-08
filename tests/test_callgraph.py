@@ -421,6 +421,110 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(len(edges), 1)
             self.assertEqual(edges[0].target_id, symbol_id("app.service.Client.run"))
 
+    def test_typescript_new_constructor_receiver_prefers_owner_method(self) -> None:
+        source = (
+            "class SearchService {\n"
+            "  run() { return 1; }\n"
+            "}\n"
+            "class AuditService {\n"
+            "  run() { return 0; }\n"
+            "}\n"
+            "const svc = new SearchService();\n"
+            "function caller() {\n"
+            "  return svc.run();\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.ts"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "typescript")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=8,
+                    end_line=10,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.SearchService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.AuditService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=5,
+                    end_line=5,
+                ),
+            ]
+            edges = build_call_edges(parsed, file_symbols, file_symbols)
+            caller_id = symbol_id("app.service.caller")
+            caller_edges = [
+                edge for edge in edges if edge.source_id == caller_id and int(edge.line_number or 0) == 9
+            ]
+            self.assertEqual(len(caller_edges), 1)
+            self.assertEqual(caller_edges[0].target_id, symbol_id("app.service.SearchService.run"))
+
+    def test_java_new_constructor_receiver_prefers_owner_method(self) -> None:
+        source = (
+            "class SearchService {\n"
+            "  int run() { return 1; }\n"
+            "}\n"
+            "class AuditService {\n"
+            "  int run() { return 0; }\n"
+            "}\n"
+            "class Main {\n"
+            "  int caller() {\n"
+            "    SearchService svc = new SearchService();\n"
+            "    return svc.run();\n"
+            "  }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "Main.java"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "java")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.main.Main.caller",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=8,
+                    end_line=11,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.main.SearchService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.main.AuditService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=5,
+                    end_line=5,
+                ),
+            ]
+            edges = build_call_edges(parsed, file_symbols, file_symbols)
+            caller_id = symbol_id("app.main.Main.caller")
+            caller_edges = [
+                edge for edge in edges if edge.source_id == caller_id and int(edge.line_number or 0) == 10
+            ]
+            self.assertEqual(len(caller_edges), 1)
+            self.assertEqual(caller_edges[0].target_id, symbol_id("app.main.SearchService.run"))
+
 
 if __name__ == "__main__":
     unittest.main()

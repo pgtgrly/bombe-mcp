@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from contextlib import closing
 from pathlib import Path
@@ -18,9 +19,11 @@ from bombe.query.guards import (
     truncate_query,
 )
 from bombe.store.database import Database
+from bombe.query.tokenizer import estimate_tokens
 
 
 RELATIONSHIPS = ("CALLS", "IMPORTS_SYMBOL", "EXTENDS", "IMPLEMENTS", "HAS_METHOD")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
 
 
 def _resolve_path(file_path: str) -> Path:
@@ -38,10 +41,27 @@ def _source_fragment(file_path: str, start_line: int, end_line: int) -> str:
     return "\n".join(lines[start_idx:end_idx])
 
 
-def _approx_tokens(text: str) -> int:
-    if not text:
+def _query_terms(query: str) -> set[str]:
+    terms = {match.group(0).lower() for match in WORD_RE.finditer(query)}
+    return {term for term in terms if len(term) >= 2}
+
+
+def _symbol_query_relevance(
+    name: str,
+    qualified_name: str,
+    signature: str,
+    query_terms: set[str],
+) -> int:
+    if not query_terms:
         return 0
-    return max(1, int(len(text) / 3.5))
+    haystacks = [name.lower(), qualified_name.lower(), signature.lower()]
+    score = 0
+    for term in query_terms:
+        for haystack in haystacks:
+            if term in haystack:
+                score += 1
+                break
+    return score
 
 
 def _pick_seeds(conn, req: ContextRequest) -> list[int]:
@@ -245,6 +265,7 @@ def _quality_metrics(
     token_budget: int,
     tokens_used: int,
     adjacency: dict[int, set[int]],
+    duplicate_skips: int = 0,
 ) -> dict[str, object]:
     if not included_symbols:
         return {
@@ -253,6 +274,7 @@ def _quality_metrics(
             "token_efficiency": 0.0,
             "avg_depth": 0.0,
             "included_count": 0,
+            "dedupe_ratio": 1.0,
         }
 
     included_ids = {int(symbol["id"]) for symbol in included_symbols}
@@ -281,6 +303,10 @@ def _quality_metrics(
         "token_efficiency": round(token_efficiency, 4),
         "avg_depth": round(avg_depth, 4),
         "included_count": len(included_symbols),
+        "dedupe_ratio": round(
+            len(included_symbols) / max(1, len(included_symbols) + duplicate_skips),
+            4,
+        ),
     }
 
 
@@ -331,6 +357,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             """,
             symbol_ids,
         ).fetchall()
+        query_terms = _query_terms(normalized_request.query)
 
         ranked: list[tuple[float, dict[str, object]]] = []
         for row in symbol_rows:
@@ -338,7 +365,15 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             depth = reached[symbol_id]
             ppr = ppr_scores.get(symbol_id, 0.0)
             proximity_bonus = {0: 1.0, 1: 0.7, 2: 0.4}.get(depth, 0.25)
-            score = ppr * max(float(row["pagerank_score"] or 0.0), 1e-9) * proximity_bonus
+            base_score = ppr * max(float(row["pagerank_score"] or 0.0), 1e-9) * proximity_bonus
+            lexical_relevance = _symbol_query_relevance(
+                name=str(row["name"]),
+                qualified_name=str(row["qualified_name"]),
+                signature=str(row["signature"] or ""),
+                query_terms=query_terms,
+            )
+            lexical_boost = 1.0 + min(0.25, 0.08 * lexical_relevance)
+            score = base_score * lexical_boost
             ranked.append(
                 (
                     score,
@@ -363,6 +398,8 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
 
         tokens_used = 0
         included_symbols: list[dict[str, object]] = []
+        seen_bundle_keys: set[tuple[str, str, str]] = set()
+        duplicate_skips = 0
         for symbol_id, topology_reason in topology_order:
             if len(included_symbols) >= MAX_GRAPH_VISITED:
                 break
@@ -379,15 +416,32 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 mode = "full_source"
             if not include_full:
                 source = str(symbol["signature"])
-            symbol_tokens = _approx_tokens(source)
+            bundle_key = (
+                str(symbol["qualified_name"]),
+                str(symbol["file_path"]),
+                source,
+            )
+            if bundle_key in seen_bundle_keys:
+                duplicate_skips += 1
+                continue
+            symbol_tokens = estimate_tokens(source)
             if tokens_used + symbol_tokens > normalized_request.token_budget:
                 if mode == "full_source":
                     source = str(symbol["signature"])
                     mode = "signature_only"
-                    symbol_tokens = _approx_tokens(source)
+                    bundle_key = (
+                        str(symbol["qualified_name"]),
+                        str(symbol["file_path"]),
+                        source,
+                    )
+                    if bundle_key in seen_bundle_keys:
+                        duplicate_skips += 1
+                        continue
+                    symbol_tokens = estimate_tokens(source)
                 if tokens_used + symbol_tokens > normalized_request.token_budget:
                     continue
             tokens_used += symbol_tokens
+            seen_bundle_keys.add(bundle_key)
             reason_parts = [topology_reason, f"depth={symbol['depth']}", f"mode={mode}"]
             if symbol["is_seed"]:
                 reason_parts.append("seed_match")
@@ -423,6 +477,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             token_budget=normalized_request.token_budget,
             tokens_used=tokens_used,
             adjacency=adjacency,
+            duplicate_skips=duplicate_skips,
         )
 
         payload = {

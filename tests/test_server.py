@@ -18,6 +18,11 @@ class ServerCLITests(unittest.TestCase):
         self.assertEqual(args.command, "serve")
         self.assertEqual(args.repo, Path("."))
         self.assertEqual(args.log_level, "INFO")
+        doctor_args = parser.parse_args(["doctor"])
+        watch_args = parser.parse_args(["watch", "--max-cycles", "1"])
+        self.assertEqual(doctor_args.command, "doctor")
+        self.assertEqual(watch_args.command, "watch")
+        self.assertEqual(int(watch_args.max_cycles), 1)
 
     def test_index_and_status_commands_emit_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -100,6 +105,53 @@ class ServerCLITests(unittest.TestCase):
             self.assertIn("counts", status_payload)
             self.assertGreaterEqual(int(status_payload["counts"]["files"]), 1)
             self.assertGreaterEqual(int(status_payload["counts"]["artifact_pins"]), 1)
+
+            doctor = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "doctor",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            doctor_payload = json.loads(doctor.stdout.strip())
+            self.assertIn("status", doctor_payload)
+            self.assertIn("checks", doctor_payload)
+            self.assertGreaterEqual(len(doctor_payload["checks"]), 1)
+
+            watch = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "watch",
+                    "--max-cycles",
+                    "1",
+                    "--poll-interval-ms",
+                    "100",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            watch_payload = json.loads(watch.stdout.strip())
+            self.assertEqual(watch_payload["mode"], "watch")
+            self.assertEqual(int(watch_payload["cycles"]), 1)
 
 
 if __name__ == "__main__":

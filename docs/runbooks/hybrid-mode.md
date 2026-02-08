@@ -19,13 +19,14 @@ Hybrid mode must never block local query serving.
   - bounded timeouts
   - circuit breaker
   - artifact quarantine
+  - optional HMAC artifact signing with `BOMBE_SYNC_SIGNING_KEY`
 
 ## Operating sequence
 
 1. Build local delta from indexed changes.
 2. Push delta asynchronously with timeout budget.
 3. Pull latest compatible artifact by repo and snapshot lineage.
-4. Validate artifact checksum and compatibility.
+4. Validate artifact checksum, compatibility, and signature (when signing key is configured).
 5. Reconcile:
   - local changes win for touched files/symbols/edges,
   - artifact data reused for untouched scope.
@@ -39,6 +40,8 @@ Hybrid mode must never block local query serving.
 - Incompatible artifact:
   - skip artifact and continue local.
 - Corrupt artifact checksum:
+  - add artifact to quarantine store and do not apply.
+- Signature mismatch (when signing is enabled):
   - add artifact to quarantine store and do not apply.
 - Repeated failures:
   - circuit breaker opens and blocks new remote attempts until reset timeout.

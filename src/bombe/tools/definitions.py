@@ -33,6 +33,7 @@ from bombe.query.blast import get_blast_radius
 from bombe.query.change_impact import change_impact
 from bombe.query.context import get_context
 from bombe.query.data_flow import trace_data_flow
+from bombe.query.planner import QueryPlanner
 from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.query.structure import get_structure
@@ -53,6 +54,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "file_pattern": {"type": "string"},
             "limit": {"type": "integer", "default": 20},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["query"],
     },
@@ -67,6 +69,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "depth": {"type": "integer", "default": 1, "minimum": 1, "maximum": 5},
             "include_source": {"type": "boolean", "default": False},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -78,6 +81,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "token_budget": {"type": "integer", "default": 8000},
             "include_signatures_only": {"type": "boolean", "default": False},
             "expansion_depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["query"],
     },
@@ -87,6 +91,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "path": {"type": "string", "default": "."},
             "token_budget": {"type": "integer", "default": 4000},
             "include_signatures": {"type": "boolean", "default": True},
+            "include_explanations": {"type": "boolean", "default": False},
         },
     },
     "get_blast_radius": {
@@ -99,6 +104,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "default": "behavior",
             },
             "max_depth": {"type": "integer", "default": 3},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -112,6 +118,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "default": "both",
             },
             "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -125,6 +132,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "default": "behavior",
             },
             "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
+            "include_explanations": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -156,22 +164,102 @@ def _safe_record_tool_metric(db: Database, **metric_kwargs: Any) -> None:
         )
 
 
+def _with_explanations(
+    tool_name: str,
+    payload: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    if not bool(payload.get("include_explanations", False)):
+        return response
+    explanation: dict[str, Any]
+    if tool_name == "search_symbols":
+        symbols = response.get("symbols", [])
+        strategy_counts: dict[str, int] = {}
+        for symbol in symbols if isinstance(symbols, list) else []:
+            if not isinstance(symbol, dict):
+                continue
+            strategy = str(symbol.get("match_strategy", "unknown"))
+            strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+        explanation = {
+            "query": str(payload.get("query", "")),
+            "total_matches": int(response.get("total_matches", 0)),
+            "match_strategies": strategy_counts,
+        }
+    elif tool_name == "get_references":
+        explanation = {
+            "symbol": str(payload.get("symbol_name", "")),
+            "direction": str(payload.get("direction", "both")),
+            "depth": int(payload.get("depth", 1)),
+            "counts": {
+                "callers": len(response.get("callers", [])),
+                "callees": len(response.get("callees", [])),
+                "implementors": len(response.get("implementors", [])),
+                "supers": len(response.get("supers", [])),
+            },
+        }
+    elif tool_name == "get_context":
+        bundle = response.get("context_bundle", {})
+        metrics = bundle.get("quality_metrics", {}) if isinstance(bundle, dict) else {}
+        explanation = {
+            "query": str(response.get("query", "")),
+            "selection_strategy": (
+                str(bundle.get("selection_strategy", "unknown"))
+                if isinstance(bundle, dict)
+                else "unknown"
+            ),
+            "quality_metrics": metrics,
+        }
+    elif tool_name == "get_blast_radius":
+        impact = response.get("impact", {})
+        explanation = {
+            "symbol": str(response.get("target", {}).get("name", "")) if isinstance(response.get("target"), dict) else "",
+            "change_type": str(response.get("change_type", "")),
+            "total_affected_symbols": int(impact.get("total_affected_symbols", 0)) if isinstance(impact, dict) else 0,
+            "total_affected_files": int(impact.get("total_affected_files", 0)) if isinstance(impact, dict) else 0,
+        }
+    elif tool_name == "trace_data_flow":
+        explanation = {
+            "direction": str(response.get("direction", "both")),
+            "max_depth": int(response.get("max_depth", 0)),
+            "node_count": len(response.get("nodes", [])),
+            "path_count": len(response.get("paths", [])),
+        }
+    else:
+        impact = response.get("impact", {})
+        explanation = {
+            "change_type": str(response.get("change_type", "behavior")),
+            "max_depth": int(response.get("max_depth", 0)),
+            "risk_level": str(impact.get("risk_level", "")) if isinstance(impact, dict) else "",
+            "total_affected_symbols": int(impact.get("total_affected_symbols", 0)) if isinstance(impact, dict) else 0,
+        }
+    return {**response, "explanations": explanation}
+
+
 def _instrument_handler(
     db: Database,
     tool_name: str,
     handler: ToolHandler,
+    planner: QueryPlanner | None = None,
 ) -> ToolHandler:
     def wrapped(payload: dict[str, Any]) -> dict[str, Any] | str:
         started = time.perf_counter()
+        mode = "local"
         try:
-            result = handler(payload)
+            if planner is not None:
+                result, mode = planner.get_or_compute(
+                    tool_name=tool_name,
+                    payload=payload,
+                    compute=lambda: handler(payload),
+                )
+            else:
+                result = handler(payload)
             latency_ms = (time.perf_counter() - started) * 1000.0
             _safe_record_tool_metric(
                 db,
                 tool_name=tool_name,
                 latency_ms=latency_ms,
                 success=True,
-                mode="local",
+                mode=mode,
                 repo_id=None,
                 result_size=_result_size(result),
                 error_message=None,
@@ -184,7 +272,7 @@ def _instrument_handler(
                 tool_name=tool_name,
                 latency_ms=latency_ms,
                 success=False,
-                mode="local",
+                mode=mode,
                 repo_id=None,
                 result_size=None,
                 error_message=str(exc),
@@ -205,7 +293,8 @@ def _search_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
             limit=clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT),
         ),
     )
-    return {"symbols": response.symbols, "total_matches": response.total_matches}
+    base = {"symbols": response.symbols, "total_matches": response.total_matches}
+    return _with_explanations("search_symbols", payload, base)
 
 
 def _references_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
@@ -218,7 +307,7 @@ def _references_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]
             include_source=bool(payload.get("include_source", False)),
         ),
     )
-    return response.payload
+    return _with_explanations("get_references", payload, response.payload)
 
 
 def _context_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
@@ -240,11 +329,11 @@ def _context_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
             ),
         ),
     )
-    return response.payload
+    return _with_explanations("get_context", payload, response.payload)
 
 
 def _structure_handler(db: Database, payload: dict[str, Any]) -> str:
-    return get_structure(
+    structure = get_structure(
         db,
         StructureRequest(
             path=str(payload.get("path", ".")),
@@ -256,6 +345,14 @@ def _structure_handler(db: Database, payload: dict[str, Any]) -> str:
             include_signatures=bool(payload.get("include_signatures", True)),
         ),
     )
+    if not bool(payload.get("include_explanations", False)):
+        return structure
+    line_count = len(structure.splitlines()) if structure else 0
+    prefix = (
+        f"# structure_explanations path={payload.get('path', '.')} "
+        f"lines={line_count} token_budget={payload.get('token_budget', 4000)}"
+    )
+    return f"{prefix}\n{structure}" if structure else prefix
 
 
 def _blast_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
@@ -267,45 +364,73 @@ def _blast_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
             max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_IMPACT_DEPTH),
         ),
     )
-    return response.payload
+    return _with_explanations("get_blast_radius", payload, response.payload)
 
 
 def _data_flow_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
-    return trace_data_flow(
+    base = trace_data_flow(
         db,
         symbol_name=truncate_query(str(payload["symbol_name"])),
         direction=str(payload.get("direction", "both")),
         max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_FLOW_DEPTH),
     )
+    return _with_explanations("trace_data_flow", payload, base)
 
 
 def _change_impact_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
-    return change_impact(
+    base = change_impact(
         db,
         symbol_name=truncate_query(str(payload["symbol_name"])),
         change_type=str(payload.get("change_type", "behavior")),
         max_depth=clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_IMPACT_DEPTH),
     )
+    return _with_explanations("change_impact", payload, base)
 
 
 def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
     del repo_root
-    search_handler = _instrument_handler(db, "search_symbols", lambda payload: _search_handler(db, payload))
-    references_handler = _instrument_handler(
-        db, "get_references", lambda payload: _references_handler(db, payload)
+    planner = QueryPlanner(max_entries=1024, ttl_seconds=30.0)
+    search_handler = _instrument_handler(
+        db,
+        "search_symbols",
+        lambda payload: _search_handler(db, payload),
+        planner=planner,
     )
-    context_handler = _instrument_handler(db, "get_context", lambda payload: _context_handler(db, payload))
+    references_handler = _instrument_handler(
+        db,
+        "get_references",
+        lambda payload: _references_handler(db, payload),
+        planner=planner,
+    )
+    context_handler = _instrument_handler(
+        db,
+        "get_context",
+        lambda payload: _context_handler(db, payload),
+        planner=planner,
+    )
     structure_handler = _instrument_handler(
-        db, "get_structure", lambda payload: _structure_handler(db, payload)
+        db,
+        "get_structure",
+        lambda payload: _structure_handler(db, payload),
+        planner=planner,
     )
     blast_handler = _instrument_handler(
-        db, "get_blast_radius", lambda payload: _blast_handler(db, payload)
+        db,
+        "get_blast_radius",
+        lambda payload: _blast_handler(db, payload),
+        planner=planner,
     )
     data_flow_handler = _instrument_handler(
-        db, "trace_data_flow", lambda payload: _data_flow_handler(db, payload)
+        db,
+        "trace_data_flow",
+        lambda payload: _data_flow_handler(db, payload),
+        planner=planner,
     )
     impact_handler = _instrument_handler(
-        db, "change_impact", lambda payload: _change_impact_handler(db, payload)
+        db,
+        "change_impact",
+        lambda payload: _change_impact_handler(db, payload),
+        planner=planner,
     )
     return {
         "search_symbols": {

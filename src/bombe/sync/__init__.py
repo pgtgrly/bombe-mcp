@@ -8,7 +8,9 @@ from bombe.sync.client import (
     SyncClient,
     SyncResult,
     build_artifact_checksum,
+    build_artifact_signature,
     validate_artifact_checksum,
+    validate_artifact_signature,
 )
 from bombe.sync.orchestrator import SyncCycleReport, run_sync_cycle
 from bombe.sync.reconcile import PromotionResult, promote_delta, reconcile_artifact
@@ -22,7 +24,9 @@ __all__ = [
     "SyncClient",
     "SyncResult",
     "build_artifact_checksum",
+    "build_artifact_signature",
     "validate_artifact_checksum",
+    "validate_artifact_signature",
     "PromotionResult",
     "promote_delta",
     "reconcile_artifact",

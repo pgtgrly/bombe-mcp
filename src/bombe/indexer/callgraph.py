@@ -29,6 +29,18 @@ PY_IMPORT_ALIAS_RE = re.compile(
 )
 JAVA_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_.*]+);""")
 GO_IMPORT_RE = re.compile(r'''"([^"]+)"''')
+PY_ASSIGN_TYPE_RE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("""
+)
+JAVA_NEW_TYPE_RE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_<>?,\s]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("""
+)
+TS_NEW_TYPE_RE = re.compile(
+    r"""^\s*(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([A-Za-z_][A-Za-z0-9_<>]*))?\s*=\s*new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("""
+)
+GO_SHORT_DECL_TYPE_RE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*&?([A-Za-z_][A-Za-z0-9_]*)\s*\{"""
+)
 CALL_KEYWORDS = {
     "if",
     "for",
@@ -253,6 +265,68 @@ def _receiver_types_for_call(
     return hints
 
 
+def _type_name_tokens(type_name: str) -> set[str]:
+    value = type_name.strip()
+    if not value:
+        return set()
+    lowered = value.lower()
+    tokens = {lowered}
+    for separator in (".", "::", "/"):
+        if separator in value:
+            tokens.add(value.split(separator)[-1].lower())
+    return tokens
+
+
+def _lexical_receiver_type_hints(
+    parsed: ParsedUnit,
+    receiver_name: str | None,
+    line_number: int,
+    window: int = 60,
+) -> set[str]:
+    if not receiver_name:
+        return set()
+    receiver = receiver_name.strip()
+    if not receiver:
+        return set()
+
+    lines = parsed.source.splitlines()
+    end_index = min(max(line_number - 1, 0), len(lines))
+    begin_index = max(0, end_index - window)
+    hints: set[str] = set()
+    for index in range(end_index - 1, begin_index - 1, -1):
+        line = lines[index]
+        py_match = PY_ASSIGN_TYPE_RE.match(line)
+        if py_match and py_match.group(1) == receiver:
+            hints.add(py_match.group(2))
+
+        java_match = JAVA_NEW_TYPE_RE.match(line)
+        if java_match and java_match.group(2) == receiver:
+            declared = java_match.group(1).strip().split("<", maxsplit=1)[0]
+            constructed = java_match.group(3).strip()
+            hints.add(declared)
+            hints.add(constructed)
+
+        ts_match = TS_NEW_TYPE_RE.match(line)
+        if ts_match and ts_match.group(1) == receiver:
+            declared = (ts_match.group(2) or "").strip().split("<", maxsplit=1)[0]
+            constructed = ts_match.group(3).strip()
+            if declared:
+                hints.add(declared)
+            hints.add(constructed)
+
+        go_match = GO_SHORT_DECL_TYPE_RE.match(line)
+        if go_match and go_match.group(1) == receiver:
+            hints.add(go_match.group(2))
+    return hints
+
+
+def _method_owner_name(symbol: SymbolRecord) -> str:
+    parts = symbol.qualified_name.split(".")
+    if len(parts) < 2:
+        return ""
+    return parts[-2]
+
+
 def _caller_for_line(line_number: int, file_symbols: list[SymbolRecord]) -> SymbolRecord | None:
     containing = [
         symbol
@@ -356,6 +430,7 @@ def _resolve_targets(
     import_hints: set[str],
     alias_hints: dict[str, set[str]],
     receiver_type_hints: set[str],
+    lexical_receiver_type_hints: set[str],
 ) -> tuple[list[SymbolRecord], float]:
     callee_name = callsite.callee_name
     candidate_names = {callee_name}
@@ -375,17 +450,37 @@ def _resolve_targets(
         if class_scoped and receiver in {"", "self", "cls", "this"}:
             return class_scoped, 1.0 if len(class_scoped) == 1 else 0.78
 
-    if receiver_type_hints:
+    combined_type_hints = set(receiver_type_hints)
+    combined_type_hints.update(lexical_receiver_type_hints)
+    if combined_type_hints:
+        type_tokens: set[str] = set()
+        for hint in combined_type_hints:
+            type_tokens.update(_type_name_tokens(hint))
         typed_matches = []
         for symbol in matches:
             if symbol.kind != "method":
                 continue
-            parts = symbol.qualified_name.split(".")
-            owner = parts[-2] if len(parts) >= 2 else ""
-            if owner in receiver_type_hints:
+            owner = _method_owner_name(symbol)
+            owner_tokens = _type_name_tokens(owner)
+            if owner_tokens & type_tokens:
                 typed_matches.append(symbol)
         if typed_matches:
-            return typed_matches, 1.0 if len(typed_matches) == 1 else 0.82
+            return typed_matches, 1.0 if len(typed_matches) == 1 else 0.84
+
+    alias_receiver_hints = alias_hints.get(callsite.receiver_name or "", set())
+    if alias_receiver_hints:
+        alias_tokens: set[str] = set()
+        for hint in alias_receiver_hints:
+            alias_tokens.update(_type_name_tokens(hint))
+        alias_typed_matches = []
+        for symbol in matches:
+            if symbol.kind != "method":
+                continue
+            owner = _method_owner_name(symbol)
+            if _type_name_tokens(owner) & alias_tokens:
+                alias_typed_matches.append(symbol)
+        if alias_typed_matches:
+            return alias_typed_matches, 1.0 if len(alias_typed_matches) == 1 else 0.83
 
     if receiver and receiver not in {"self", "cls", "this"}:
         class_receiver = []
@@ -455,6 +550,7 @@ def build_call_edges(
             hints,
             alias_hints,
             _receiver_types_for_call(caller, callsite, receiver_hint_blocks),
+            _lexical_receiver_type_hints(parsed, callsite.receiver_name, callsite.line_number),
         )
         for target in targets:
             if symbol_id_lookup is None:

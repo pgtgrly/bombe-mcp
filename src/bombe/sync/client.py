@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import threading
 import time
@@ -58,6 +59,7 @@ class ControlPlaneTransport(Protocol):
 def build_artifact_checksum(artifact: ArtifactBundle) -> str:
     payload = asdict(artifact)
     payload.pop("checksum", None)
+    payload.pop("signature", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -66,6 +68,29 @@ def validate_artifact_checksum(artifact: ArtifactBundle) -> bool:
     if not artifact.checksum:
         return False
     return artifact.checksum == build_artifact_checksum(artifact)
+
+
+def _signature_payload(artifact: ArtifactBundle) -> str:
+    payload = asdict(artifact)
+    payload.pop("signature", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return canonical
+
+
+def build_artifact_signature(artifact: ArtifactBundle, signing_key: str) -> str:
+    canonical = _signature_payload(artifact)
+    return hmac.new(
+        signing_key.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def validate_artifact_signature(artifact: ArtifactBundle, signing_key: str) -> bool:
+    if not artifact.signature:
+        return False
+    expected = build_artifact_signature(artifact, signing_key)
+    return hmac.compare_digest(str(artifact.signature), expected)
 
 
 class ArtifactQuarantineStore:
@@ -236,12 +261,14 @@ class SyncClient:
         timeout_seconds: float = 0.5,
         circuit_breaker: CircuitBreaker | None = None,
         quarantine_store: ArtifactQuarantineStore | None = None,
+        signing_key: str | None = None,
     ) -> None:
         self.transport = transport
         self.policy = policy
         self.timeout_seconds = max(0.01, timeout_seconds)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.quarantine_store = quarantine_store or ArtifactQuarantineStore()
+        self.signing_key = signing_key
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bombe-sync")
 
     def close(self) -> None:
@@ -354,6 +381,17 @@ class SyncClient:
                 reason="checksum_mismatch",
                 detail={"artifact_id": artifact.artifact_id},
             )
+
+        if self.signing_key:
+            if not validate_artifact_signature(artifact, self.signing_key):
+                self.circuit_breaker.record_failure()
+                self.quarantine_store.add(artifact.artifact_id, "signature_mismatch")
+                return PullResult(
+                    artifact=None,
+                    mode="local_fallback",
+                    reason="signature_mismatch",
+                    detail={"artifact_id": artifact.artifact_id},
+                )
 
         self.circuit_breaker.record_success()
         return PullResult(artifact=artifact, mode="remote_artifact", reason="pulled")

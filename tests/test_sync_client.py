@@ -12,6 +12,7 @@ from bombe.sync.client import (
     CompatibilityPolicy,
     SyncClient,
     build_artifact_checksum,
+    build_artifact_signature,
 )
 
 
@@ -35,6 +36,7 @@ def _build_artifact(
     schema_version: int = ARTIFACT_SCHEMA_VERSION,
     tool_version: str = "0.1.0",
     with_checksum: bool = True,
+    signing_key: str | None = None,
 ) -> ArtifactBundle:
     symbol_key = SymbolKey.from_fields(
         qualified_name="pkg.run",
@@ -54,7 +56,9 @@ def _build_artifact(
         promoted_symbols=[symbol_key],
     )
     if with_checksum:
-        return replace(artifact, checksum=build_artifact_checksum(artifact))
+        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
+    if signing_key:
+        artifact = replace(artifact, signature=build_artifact_signature(artifact, signing_key))
     return artifact
 
 
@@ -164,6 +168,35 @@ class SyncClientTests(unittest.TestCase):
         result = client.pull_artifact("repo", "snap_1", "snap_0")
         self.assertIsNotNone(result.artifact)
         self.assertEqual(result.mode, "remote_artifact")
+        self.assertEqual(result.reason, "pulled")
+
+    def test_pull_artifact_signature_mismatch_is_quarantined(self) -> None:
+        artifact = _build_artifact(signing_key="correct-key")
+        quarantine = ArtifactQuarantineStore()
+        client = SyncClient(
+            transport=_FakeTransport(artifact=artifact),
+            policy=CompatibilityPolicy(tool_version="0.1.0"),
+            timeout_seconds=0.2,
+            quarantine_store=quarantine,
+            signing_key="wrong-key",
+        )
+        self.addCleanup(client.close)
+        result = client.pull_artifact("repo", "snap_1", "snap_0")
+        self.assertIsNone(result.artifact)
+        self.assertEqual(result.reason, "signature_mismatch")
+        self.assertTrue(quarantine.is_quarantined("artifact_1"))
+
+    def test_pull_artifact_signature_match_succeeds(self) -> None:
+        artifact = _build_artifact(signing_key="shared-key")
+        client = SyncClient(
+            transport=_FakeTransport(artifact=artifact),
+            policy=CompatibilityPolicy(tool_version="0.1.0"),
+            timeout_seconds=0.2,
+            signing_key="shared-key",
+        )
+        self.addCleanup(client.close)
+        result = client.pull_artifact("repo", "snap_1", "snap_0")
+        self.assertIsNotNone(result.artifact)
         self.assertEqual(result.reason, "pulled")
 
     def test_circuit_breaker_opens_and_recovers(self) -> None:

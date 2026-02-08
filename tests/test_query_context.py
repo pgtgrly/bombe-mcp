@@ -70,6 +70,8 @@ class QueryContextTests(unittest.TestCase):
             self.assertLessEqual(metrics["connectedness"], 1.0)
             self.assertGreaterEqual(metrics["token_efficiency"], 0.0)
             self.assertLessEqual(metrics["token_efficiency"], 1.0)
+            self.assertGreaterEqual(metrics["dedupe_ratio"], 0.0)
+            self.assertLessEqual(metrics["dedupe_ratio"], 1.0)
             files = bundle["files"]
             symbol_names = [
                 symbol["name"]

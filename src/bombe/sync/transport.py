@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from dataclasses import replace
 from dataclasses import asdict
 from pathlib import Path
 
 from bombe.models import ArtifactBundle, EdgeContractRecord, IndexDelta, SymbolKey
+from bombe.sync.client import build_artifact_signature
 from bombe.sync.reconcile import promote_delta
 
 
@@ -80,13 +83,15 @@ def _artifact_from_dict(payload: dict[str, object]) -> ArtifactBundle:
         impact_priors=impact_priors if isinstance(impact_priors, list) else [],
         flow_hints=flow_hints if isinstance(flow_hints, list) else [],
         checksum=payload.get("checksum"),
+        signature=payload.get("signature"),
     )
 
 
 class FileControlPlaneTransport:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, signing_key: str | None = None) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.signing_key = signing_key or os.getenv("BOMBE_SYNC_SIGNING_KEY")
 
     def _repo_delta_dir(self, repo_id: str) -> Path:
         directory = self.root / "deltas" / _safe_repo_key(repo_id)
@@ -113,7 +118,13 @@ class FileControlPlaneTransport:
         if promoted.promoted and promoted.artifact is not None:
             artifact_promoted = True
             artifact_dir = self._repo_artifact_dir(delta.header.repo_id)
-            artifact_payload = asdict(promoted.artifact)
+            artifact = promoted.artifact
+            if self.signing_key:
+                artifact = replace(
+                    artifact,
+                    signature=build_artifact_signature(artifact, self.signing_key),
+                )
+            artifact_payload = asdict(artifact)
             artifact_path = artifact_dir / f"{promoted.artifact.artifact_id}.json"
             latest_path = artifact_dir / "latest.json"
             artifact_path.write_text(json.dumps(artifact_payload, sort_keys=True), encoding="utf-8")

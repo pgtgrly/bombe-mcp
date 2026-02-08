@@ -6,6 +6,7 @@ import argparse
 import inspect
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +16,8 @@ from bombe.sync.orchestrator import run_sync_cycle
 from bombe.sync.transport import FileControlPlaneTransport
 from bombe.watcher.git_diff import get_changed_files
 from bombe.config import build_settings
-from bombe.store.database import Database
-from bombe.tools.definitions import register_tools
+from bombe.store.database import Database, SCHEMA_VERSION
+from bombe.tools.definitions import build_tool_registry, register_tools
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,7 +85,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inc_parser.add_argument("--workers", type=int, default=4, help="Worker count hint.")
 
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Run incremental indexing loop with polling and optional sync.",
+    )
+    watch_parser.add_argument("--workers", type=int, default=4, help="Worker count hint.")
+    watch_parser.add_argument(
+        "--poll-interval-ms",
+        type=int,
+        default=1000,
+        help="Polling interval for git changes in milliseconds.",
+    )
+    watch_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=0,
+        help="Optional loop cycle cap for watch mode. 0 means run until interrupted.",
+    )
+
     subparsers.add_parser("status", help="Print local index status and exit.")
+    subparsers.add_parser("doctor", help="Run runtime and environment health checks.")
     parser.set_defaults(command="serve")
     return parser
 
@@ -250,6 +270,156 @@ def _status_payload(db: Database, repo_root: Path) -> dict[str, Any]:
     }
 
 
+def _is_path_writable(directory: Path) -> bool:
+    directory.mkdir(parents=True, exist_ok=True)
+    probe = directory / ".bombe-write-check"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    schema_row = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
+    schema_version = int(schema_row[0]["value"]) if schema_row else 0
+    checks.append(
+        {
+            "name": "schema_version",
+            "status": "ok" if schema_version == SCHEMA_VERSION else "degraded",
+            "detail": {
+                "expected": SCHEMA_VERSION,
+                "actual": schema_version,
+            },
+        }
+    )
+
+    db_writable = _is_path_writable(db.db_path.parent)
+    checks.append(
+        {
+            "name": "db_directory_writable",
+            "status": "ok" if db_writable else "degraded",
+            "detail": {"path": db.db_path.parent.as_posix()},
+        }
+    )
+
+    control_plane_root = getattr(args, "control_plane_root", None)
+    if control_plane_root is None:
+        control_plane_root = repo_root / ".bombe" / "control-plane"
+    control_plane_writable = _is_path_writable(Path(control_plane_root))
+    checks.append(
+        {
+            "name": "control_plane_writable",
+            "status": "ok" if control_plane_writable else "degraded",
+            "detail": {"path": Path(control_plane_root).as_posix()},
+        }
+    )
+
+    try:
+        from mcp.server.fastmcp import FastMCP  # type: ignore
+    except Exception:
+        checks.append(
+            {
+                "name": "mcp_runtime",
+                "status": "degraded",
+                "detail": {"available": False},
+            }
+        )
+    else:
+        _ = FastMCP
+        checks.append(
+            {
+                "name": "mcp_runtime",
+                "status": "ok",
+                "detail": {"available": True},
+            }
+        )
+
+    tool_registry = build_tool_registry(db, repo_root.as_posix())
+    checks.append(
+        {
+            "name": "tool_registry",
+            "status": "ok" if len(tool_registry) >= 7 else "degraded",
+            "detail": {"tool_count": len(tool_registry)},
+        }
+    )
+
+    overall_status = "ok"
+    if any(check["status"] != "ok" for check in checks):
+        overall_status = "degraded"
+    recommendations = []
+    if overall_status != "ok":
+        recommendations = [
+            "Run bombe status to inspect local index and sync counters.",
+            "If MCP runtime is unavailable, install runtime dependency before serving STDIO MCP.",
+            "Ensure DB/control-plane directories are writable for indexing and sync state.",
+        ]
+    return {
+        "status": overall_status,
+        "repo_root": repo_root.as_posix(),
+        "db_path": db.db_path.as_posix(),
+        "checks": checks,
+        "recommendations": recommendations,
+    }
+
+
+def _run_watch(
+    repo_root: Path,
+    db: Database,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    poll_interval_ms = max(100, int(getattr(args, "poll_interval_ms", 1000)))
+    max_cycles = max(0, int(getattr(args, "max_cycles", 0)))
+    workers = int(getattr(args, "workers", 4))
+    cycles = 0
+    runs = 0
+    changed_files_total = 0
+    files_indexed_total = 0
+    last_index_payload: dict[str, Any] | None = None
+    last_sync_payload: dict[str, Any] | None = None
+
+    while True:
+        cycles += 1
+        changes = get_changed_files(repo_root)
+        changed_files_total += len(changes)
+        if changes:
+            last_index_payload = _run_incremental_index(
+                repo_root=repo_root,
+                db=db,
+                workers=workers,
+                changes=changes,
+            )
+            runs += 1
+            files_indexed_total += int(last_index_payload.get("files_indexed", 0))
+            sync_payload = _run_hybrid_sync(
+                repo_root=repo_root,
+                db=db,
+                args=args,
+                changes=changes,
+            )
+            if sync_payload is not None:
+                last_sync_payload = sync_payload
+        if max_cycles > 0 and cycles >= max_cycles:
+            break
+        try:
+            time.sleep(poll_interval_ms / 1000.0)
+        except KeyboardInterrupt:
+            break
+
+    return {
+        "mode": "watch",
+        "cycles": cycles,
+        "index_runs": runs,
+        "changed_files_seen": changed_files_total,
+        "files_indexed": files_indexed_total,
+        "poll_interval_ms": poll_interval_ms,
+        "last_index": last_index_payload,
+        "last_sync": last_sync_payload,
+    }
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -298,6 +468,16 @@ def main() -> None:
 
     if command == "status":
         payload = _status_payload(db, settings.repo_root)
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "doctor":
+        payload = _doctor_payload(db, settings.repo_root, args)
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "watch":
+        payload = _run_watch(settings.repo_root, db, args)
         print(json.dumps(payload, sort_keys=True))
         return
 

@@ -87,7 +87,9 @@ PYTHONPATH=src python3 -m bombe.server --repo . --log-level INFO
   - `--index-mode none|full|incremental`: optional pre-serve index action.
 - `index-full`: run full index and exit (prints JSON stats).
 - `index-incremental`: run incremental index from git diff and exit (prints JSON stats).
+- `watch`: poll git changes and run incremental indexing loop (prints JSON summary).
 - `status`: print index/sync status JSON and exit.
+- `doctor`: run health checks for schema/runtime/writability/tool registry (prints JSON report).
 
 ### Command examples
 
@@ -121,10 +123,24 @@ Status:
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo status
 ```
 
+Watch mode (single cycle example):
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --max-cycles 1 --poll-interval-ms 500
+```
+
+Doctor:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor
+```
+
 ### Environment variables
 
 - `BOMBE_RUN_PERF=1`: enables perf suites in `tests/perf`
 - `BOMBE_PERF_HISTORY=/absolute/path/file.jsonl`: metrics history output for perf suites and release gate evaluation
+- `BOMBE_SYNC_SIGNING_KEY=your-shared-secret`: enables HMAC signing/verification for hybrid artifacts
+- `BOMBE_REAL_REPO_PATHS=/path/to/repo1,/path/to/repo2`: enables optional real-repo perf/eval test coverage
 
 ## Spec completion roadmap
 
@@ -166,6 +182,8 @@ Bombe is split into local runtime modules and optional hybrid modules.
   - data flow
   - change impact
 - MCP tool registration and handler wiring
+- Query planner cache layer for repeated payloads
+- Tokenizer abstraction with optional model-aware token counting (`tiktoken` if installed)
 
 ### Hybrid modules
 
@@ -175,6 +193,7 @@ Bombe is split into local runtime modules and optional hybrid modules.
   - timeout budgets
   - circuit breaker
   - checksum validation
+  - optional HMAC artifact signature verification
   - quarantine
 - `src/bombe/sync/reconcile.py`:
   - promotion policy gates
@@ -282,6 +301,14 @@ Available tools:
 {"symbol_name":"app.auth.authenticate","change_type":"signature","max_depth":3}
 ```
 
+All dict-returning tools also accept:
+
+```json
+{"include_explanations":true}
+```
+
+When enabled, responses include an `explanations` section with reasoning metadata. `get_structure` remains a string response and prepends a structured explanation header line.
+
 ### Contract validation
 
 Strict contract behavior is verified by:
@@ -297,6 +324,7 @@ Hybrid sync is additive and does not replace local query serving.
 - Local path remains authoritative and available.
 - Incompatible artifacts are rejected.
 - Corrupt artifacts are quarantined.
+- Signature mismatches are quarantined when `BOMBE_SYNC_SIGNING_KEY` is configured.
 - Repeated remote failures open the circuit breaker.
 - Results explicitly expose fallback mode (`local_fallback`) when remote operations are skipped or fail.
 - Sync outcomes are persisted in SQLite (`sync_queue`, `sync_events`, `artifact_pins`, `circuit_breakers`).
@@ -320,6 +348,12 @@ Run perf suites:
 
 ```bash
 BOMBE_RUN_PERF=1 PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v
+```
+
+Run optional real-repo evaluation (OpenSearch/Kubernetes-style local checkouts):
+
+```bash
+BOMBE_RUN_PERF=1 BOMBE_REAL_REPO_PATHS=/abs/opensearch,/abs/kubernetes PYTHONPATH=src python3 -m unittest tests.perf.test_real_repo_eval -v
 ```
 
 Evaluate release gates:
@@ -347,6 +381,7 @@ Thresholds are defined in `src/bombe/release/gates.py`.
 - `src/bombe/release`: release gate evaluator
 - `tests`: unit and integration tests
 - `tests/perf`: perf suites and workflow harness
+- `tests/perf/real_repo_harness.py`: env-driven real-repo evaluation harness
 - `docs/plans`: implementation design docs
 - `docs/runbooks`: operator playbooks
 
@@ -396,8 +431,8 @@ PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.
 Latest local verification run (2026-02-08):
 
 - `PYTHONPATH=src python3 -m compileall src tests` -> pass
-- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`79` tests)
-- `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`4` tests)
+- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`92` tests)
+- `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`5` tests, `1` skipped when `BOMBE_REAL_REPO_PATHS` is unset)
 - `PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.final.jsonl` -> `RELEASE_GATES=PASS`
 
 ## Troubleshooting and limitations

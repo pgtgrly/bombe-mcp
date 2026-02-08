@@ -32,6 +32,12 @@ PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --init-only --
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --log-level INFO
 ```
 
+4. Run health diagnostics:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path doctor
+```
+
 ## Validation checklist
 
 - Database schema initializes without migration errors.
