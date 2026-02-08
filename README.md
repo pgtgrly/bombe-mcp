@@ -90,6 +90,7 @@ PYTHONPATH=src python3 -m bombe.server --repo . --log-level INFO
 - `watch`: poll git changes and run incremental indexing loop (prints JSON summary).
 - `status`: print index/sync status JSON and exit.
 - `doctor`: run health checks for schema/runtime/writability/tool registry (prints JSON report).
+  - `--fix`: apply safe auto-remediation for schema/queue/cache meta issues.
 
 ### Command examples
 
@@ -129,6 +130,12 @@ Watch mode (single cycle example):
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --max-cycles 1 --poll-interval-ms 500
 ```
 
+Watch mode with filesystem events when available:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --watch-mode fs --max-cycles 1
+```
+
 Doctor:
 
 ```bash
@@ -140,7 +147,10 @@ PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor
 - `BOMBE_RUN_PERF=1`: enables perf suites in `tests/perf`
 - `BOMBE_PERF_HISTORY=/absolute/path/file.jsonl`: metrics history output for perf suites and release gate evaluation
 - `BOMBE_SYNC_SIGNING_KEY=your-shared-secret`: enables HMAC signing/verification for hybrid artifacts
+- `BOMBE_SYNC_SIGNING_ALGO=hmac-sha256|ed25519`: selects artifact signature algorithm (`ed25519` requires `cryptography`)
+- `BOMBE_SYNC_KEY_ID=key-identifier`: sets artifact signing key identifier
 - `BOMBE_REAL_REPO_PATHS=/path/to/repo1,/path/to/repo2`: enables optional real-repo perf/eval test coverage
+- `BOMBE_SEMANTIC_HINTS_FILE=/abs/semantic-hints.json`: optional semantic receiver type hints for call resolution
 
 ## Spec completion roadmap
 
@@ -168,6 +178,7 @@ Bombe is split into local runtime modules and optional hybrid modules.
 
 - File scanning and language detection
 - Parser + symbol extraction + call/import resolution
+- Optional semantic receiver-type hints merged into call resolution
 - SQLite graph storage:
   - `files`
   - `symbols`
@@ -211,7 +222,7 @@ Bombe is split into local runtime modules and optional hybrid modules.
 
 ### Observability and persisted state
 
-SQLite schema version `4` includes state for operations and diagnostics:
+SQLite schema version `5` includes state for operations and diagnostics:
 
 - `sync_queue`
 - `artifact_quarantine`
@@ -220,6 +231,8 @@ SQLite schema version `4` includes state for operations and diagnostics:
 - `sync_events`
 - `tool_metrics`
 - `migration_history`
+- `trusted_signing_keys`
+- repo metadata key `cache_epoch` for query cache invalidation
 
 ## Indexing model
 
@@ -242,6 +255,7 @@ Runtime payload guardrails are enforced for depth, limits, and query lengths:
 - context token budget clamped to max `32000`
 - entry points capped at `32`
 - traversal node/edge caps prevent runaway expansion
+- adaptive traversal caps scale by repository symbol count for large-repo memory safety
 
 These limits are defined in `src/bombe/query/guards.py`.
 
@@ -309,6 +323,14 @@ All dict-returning tools also accept:
 
 When enabled, responses include an `explanations` section with reasoning metadata. `get_structure` remains a string response and prepends a structured explanation header line.
 
+All tools also accept:
+
+```json
+{"include_plan":true}
+```
+
+When enabled, dict responses include `planner_trace` metadata (cache mode, lookup/compute timing, cache epoch token).
+
 ### Contract validation
 
 Strict contract behavior is verified by:
@@ -325,6 +347,7 @@ Hybrid sync is additive and does not replace local query serving.
 - Incompatible artifacts are rejected.
 - Corrupt artifacts are quarantined.
 - Signature mismatches are quarantined when `BOMBE_SYNC_SIGNING_KEY` is configured.
+- Trusted key policy can be persisted per repository in `trusted_signing_keys` for verification key selection.
 - Repeated remote failures open the circuit breaker.
 - Results explicitly expose fallback mode (`local_fallback`) when remote operations are skipped or fail.
 - Sync outcomes are persisted in SQLite (`sync_queue`, `sync_events`, `artifact_pins`, `circuit_breakers`).
@@ -368,6 +391,7 @@ Current gate families:
 - `incremental`
 - `query`
 - `workflow_gates`
+- `gold_eval`
 
 Thresholds are defined in `src/bombe/release/gates.py`.
 
@@ -431,8 +455,8 @@ PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.
 Latest local verification run (2026-02-08):
 
 - `PYTHONPATH=src python3 -m compileall src tests` -> pass
-- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`92` tests)
-- `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`5` tests, `1` skipped when `BOMBE_REAL_REPO_PATHS` is unset)
+- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`100` tests)
+- `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`6` tests, `1` skipped when `BOMBE_REAL_REPO_PATHS` is unset)
 - `PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.final.jsonl` -> `RELEASE_GATES=PASS`
 
 ## Troubleshooting and limitations

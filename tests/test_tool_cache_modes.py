@@ -55,6 +55,19 @@ class ToolCacheModeTests(unittest.TestCase):
             self.assertEqual(str(rows[0]["mode"]), "cache_miss")
             self.assertEqual(str(rows[1]["mode"]), "cache_hit")
 
+            db.bump_cache_epoch()
+            _ = search_handler({"query": "auth", "limit": 5})
+            rows_after_bump = db.query(
+                """
+                SELECT mode
+                FROM tool_metrics
+                WHERE tool_name = 'search_symbols'
+                ORDER BY id DESC
+                LIMIT 1;
+                """
+            )
+            self.assertEqual(str(rows_after_bump[0]["mode"]), "cache_miss")
+
 
 if __name__ == "__main__":
     unittest.main()

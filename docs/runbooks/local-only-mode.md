@@ -38,6 +38,12 @@ PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --log-level IN
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path doctor
 ```
 
+5. Apply safe automatic repairs when diagnostics show degraded state:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path doctor --fix
+```
+
 ## Validation checklist
 
 - Database schema initializes without migration errors.

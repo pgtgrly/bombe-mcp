@@ -231,6 +231,8 @@ class ArtifactBundle:
     promoted_edges: list[EdgeContractRecord] = field(default_factory=list)
     impact_priors: list[dict[str, Any]] = field(default_factory=list)
     flow_hints: list[dict[str, Any]] = field(default_factory=list)
+    signature_algo: str | None = None
+    signing_key_id: str | None = None
     checksum: str | None = None
     signature: str | None = None
 

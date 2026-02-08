@@ -11,6 +11,7 @@ from bombe.query.guards import (
     MAX_GRAPH_EDGES,
     MAX_GRAPH_VISITED,
     MAX_REFERENCE_DEPTH,
+    adaptive_graph_cap,
     clamp_depth,
     truncate_query,
 )
@@ -147,6 +148,12 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
     normalized_symbol = truncate_query(req.symbol_name)
     bounded_depth = clamp_depth(req.depth, maximum=MAX_REFERENCE_DEPTH)
     with closing(db.connect()) as conn:
+        total_symbols_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM symbols;"
+        ).fetchone()
+        total_symbols = int(total_symbols_row["count"]) if total_symbols_row else 0
+        dynamic_visited_cap = adaptive_graph_cap(total_symbols, MAX_GRAPH_VISITED, floor=128)
+        dynamic_edge_cap = max(256, min(MAX_GRAPH_EDGES, dynamic_visited_cap * 2))
         symbol_id = _resolve_symbol_id(conn, normalized_symbol)
         if symbol_id is None:
             raise ValueError(f"Symbol not found: {normalized_symbol}")
@@ -175,7 +182,14 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
             directions.append("supers")
 
         for direction in directions:
-            entries = _walk(conn, symbol_id, direction, bounded_depth)
+            entries = _walk(
+                conn,
+                symbol_id,
+                direction,
+                bounded_depth,
+                max_edges=dynamic_edge_cap,
+                max_visited=dynamic_visited_cap,
+            )
             results: list[dict[str, object]] = []
             for next_id, line_number, depth, relationship in entries:
                 info = _load_symbol(conn, next_id)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -77,20 +79,120 @@ def _signature_payload(artifact: ArtifactBundle) -> str:
     return canonical
 
 
-def build_artifact_signature(artifact: ArtifactBundle, signing_key: str) -> str:
+def _load_ed25519_private_key(signing_key: str):
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except Exception:
+        return None
+    raw = signing_key.strip()
+    if not raw:
+        return None
+    if "BEGIN" in raw:
+        try:
+            loaded = serialization.load_pem_private_key(raw.encode("utf-8"), password=None)
+        except Exception:
+            return None
+        return loaded if isinstance(loaded, Ed25519PrivateKey) else None
+    decoded: bytes
+    try:
+        decoded = bytes.fromhex(raw)
+    except ValueError:
+        try:
+            decoded = base64.b64decode(raw)
+        except (binascii.Error, ValueError):
+            return None
+    if len(decoded) != 32:
+        return None
+    try:
+        return Ed25519PrivateKey.from_private_bytes(decoded)
+    except Exception:
+        return None
+
+
+def _load_ed25519_public_key(verification_key: str):
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except Exception:
+        return None
+    raw = verification_key.strip()
+    if not raw:
+        return None
+    if "BEGIN" in raw:
+        try:
+            loaded = serialization.load_pem_public_key(raw.encode("utf-8"))
+        except Exception:
+            return None
+        return loaded if isinstance(loaded, Ed25519PublicKey) else None
+    decoded: bytes
+    try:
+        decoded = bytes.fromhex(raw)
+    except ValueError:
+        try:
+            decoded = base64.b64decode(raw)
+        except (binascii.Error, ValueError):
+            return None
+    if len(decoded) != 32:
+        return None
+    try:
+        return Ed25519PublicKey.from_public_bytes(decoded)
+    except Exception:
+        return None
+
+
+def build_artifact_signature(
+    artifact: ArtifactBundle,
+    signing_key: str,
+    algorithm: str = "hmac-sha256",
+) -> str:
     canonical = _signature_payload(artifact)
-    return hmac.new(
-        signing_key.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    normalized_algo = (algorithm or "hmac-sha256").strip().lower()
+    if normalized_algo == "hmac-sha256":
+        return hmac.new(
+            signing_key.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    if normalized_algo == "ed25519":
+        private_key = _load_ed25519_private_key(signing_key)
+        if private_key is None:
+            raise ValueError("Invalid or unavailable ed25519 private key")
+        signature = private_key.sign(canonical.encode("utf-8"))
+        return signature.hex()
+    raise ValueError(f"Unsupported signature algorithm: {algorithm}")
 
 
-def validate_artifact_signature(artifact: ArtifactBundle, signing_key: str) -> bool:
+def validate_artifact_signature(
+    artifact: ArtifactBundle,
+    verification_key: str,
+    algorithm: str | None = None,
+) -> bool:
     if not artifact.signature:
         return False
-    expected = build_artifact_signature(artifact, signing_key)
-    return hmac.compare_digest(str(artifact.signature), expected)
+    normalized_algo = (
+        algorithm
+        or artifact.signature_algo
+        or "hmac-sha256"
+    ).strip().lower()
+    if normalized_algo == "hmac-sha256":
+        expected = build_artifact_signature(
+            artifact=artifact,
+            signing_key=verification_key,
+            algorithm="hmac-sha256",
+        )
+        return hmac.compare_digest(str(artifact.signature), expected)
+    if normalized_algo == "ed25519":
+        public_key = _load_ed25519_public_key(verification_key)
+        if public_key is None:
+            return False
+        try:
+            signature_bytes = bytes.fromhex(str(artifact.signature))
+            public_key.verify(signature_bytes, _signature_payload(artifact).encode("utf-8"))
+            return True
+        except Exception:
+            return False
+    return False
 
 
 class ArtifactQuarantineStore:
@@ -262,6 +364,8 @@ class SyncClient:
         circuit_breaker: CircuitBreaker | None = None,
         quarantine_store: ArtifactQuarantineStore | None = None,
         signing_key: str | None = None,
+        signing_algorithm: str = "hmac-sha256",
+        trusted_verification_keys: dict[str, str] | None = None,
     ) -> None:
         self.transport = transport
         self.policy = policy
@@ -269,6 +373,8 @@ class SyncClient:
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.quarantine_store = quarantine_store or ArtifactQuarantineStore()
         self.signing_key = signing_key
+        self.signing_algorithm = signing_algorithm.strip().lower() if signing_algorithm else "hmac-sha256"
+        self.trusted_verification_keys = trusted_verification_keys or {}
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bombe-sync")
 
     def close(self) -> None:
@@ -382,15 +488,38 @@ class SyncClient:
                 detail={"artifact_id": artifact.artifact_id},
             )
 
-        if self.signing_key:
-            if not validate_artifact_signature(artifact, self.signing_key):
+        signature_algo = (artifact.signature_algo or self.signing_algorithm or "hmac-sha256").strip().lower()
+        if artifact.signature is not None or self.signing_key or self.trusted_verification_keys:
+            verification_key: str | None = None
+            if signature_algo == "hmac-sha256":
+                verification_key = self.signing_key
+            elif signature_algo == "ed25519":
+                key_id = artifact.signing_key_id
+                if key_id:
+                    verification_key = self.trusted_verification_keys.get(key_id)
+                if verification_key is None:
+                    verification_key = self.signing_key
+            if verification_key is None:
+                self.circuit_breaker.record_failure()
+                self.quarantine_store.add(artifact.artifact_id, "signature_untrusted_key")
+                return PullResult(
+                    artifact=None,
+                    mode="local_fallback",
+                    reason="signature_untrusted_key",
+                    detail={"artifact_id": artifact.artifact_id, "algorithm": signature_algo},
+                )
+            if not validate_artifact_signature(
+                artifact=artifact,
+                verification_key=verification_key,
+                algorithm=signature_algo,
+            ):
                 self.circuit_breaker.record_failure()
                 self.quarantine_store.add(artifact.artifact_id, "signature_mismatch")
                 return PullResult(
                     artifact=None,
                     mode="local_fallback",
                     reason="signature_mismatch",
-                    detail={"artifact_id": artifact.artifact_id},
+                    detail={"artifact_id": artifact.artifact_id, "algorithm": signature_algo},
                 )
 
         self.circuit_breaker.record_success()

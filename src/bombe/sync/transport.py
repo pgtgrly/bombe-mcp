@@ -82,16 +82,32 @@ def _artifact_from_dict(payload: dict[str, object]) -> ArtifactBundle:
         promoted_edges=promoted_edges,
         impact_priors=impact_priors if isinstance(impact_priors, list) else [],
         flow_hints=flow_hints if isinstance(flow_hints, list) else [],
+        signature_algo=payload.get("signature_algo"),
+        signing_key_id=payload.get("signing_key_id"),
         checksum=payload.get("checksum"),
         signature=payload.get("signature"),
     )
 
 
 class FileControlPlaneTransport:
-    def __init__(self, root: Path, signing_key: str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        signing_key: str | None = None,
+        signing_algorithm: str | None = None,
+        signing_key_id: str | None = None,
+    ) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.signing_key = signing_key or os.getenv("BOMBE_SYNC_SIGNING_KEY")
+        self.signing_algorithm = (
+            signing_algorithm
+            or os.getenv("BOMBE_SYNC_SIGNING_ALGO", "hmac-sha256")
+        ).strip().lower()
+        self.signing_key_id = (
+            signing_key_id
+            or os.getenv("BOMBE_SYNC_KEY_ID", "local")
+        ).strip()
 
     def _repo_delta_dir(self, repo_id: str) -> Path:
         directory = self.root / "deltas" / _safe_repo_key(repo_id)
@@ -122,7 +138,16 @@ class FileControlPlaneTransport:
             if self.signing_key:
                 artifact = replace(
                     artifact,
-                    signature=build_artifact_signature(artifact, self.signing_key),
+                    signature_algo=self.signing_algorithm,
+                    signing_key_id=self.signing_key_id,
+                )
+                artifact = replace(
+                    artifact,
+                    signature=build_artifact_signature(
+                        artifact,
+                        self.signing_key,
+                        algorithm=self.signing_algorithm,
+                    ),
                 )
             artifact_payload = asdict(artifact)
             artifact_path = artifact_dir / f"{promoted.artifact.artifact_id}.json"

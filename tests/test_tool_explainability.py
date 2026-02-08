@@ -57,30 +57,65 @@ class ToolExplainabilityTests(unittest.TestCase):
 
     def test_include_explanations_adds_reasoning_payload(self) -> None:
         registry = self._registry()
-        search = registry["search_symbols"]["handler"]({"query": "auth", "include_explanations": True})
+        search = registry["search_symbols"]["handler"](
+            {"query": "auth", "include_explanations": True, "include_plan": True}
+        )
         refs = registry["get_references"]["handler"](
-            {"symbol_name": "app.authenticate", "direction": "callers", "depth": 1, "include_explanations": True}
+            {
+                "symbol_name": "app.authenticate",
+                "direction": "callers",
+                "depth": 1,
+                "include_explanations": True,
+                "include_plan": True,
+            }
         )
         context = registry["get_context"]["handler"](
-            {"query": "authenticate flow", "entry_points": ["app.authenticate"], "include_explanations": True}
+            {
+                "query": "authenticate flow",
+                "entry_points": ["app.authenticate"],
+                "include_explanations": True,
+                "include_plan": True,
+            }
         )
         blast = registry["get_blast_radius"]["handler"](
-            {"symbol_name": "app.authenticate", "max_depth": 2, "include_explanations": True}
+            {
+                "symbol_name": "app.authenticate",
+                "max_depth": 2,
+                "include_explanations": True,
+                "include_plan": True,
+            }
         )
         flow = registry["trace_data_flow"]["handler"](
-            {"symbol_name": "app.authenticate", "direction": "both", "max_depth": 2, "include_explanations": True}
+            {
+                "symbol_name": "app.authenticate",
+                "direction": "both",
+                "max_depth": 2,
+                "include_explanations": True,
+                "include_plan": True,
+            }
         )
         impact = registry["change_impact"]["handler"](
-            {"symbol_name": "app.authenticate", "max_depth": 2, "include_explanations": True}
+            {
+                "symbol_name": "app.authenticate",
+                "max_depth": 2,
+                "include_explanations": True,
+                "include_plan": True,
+            }
         )
         structure = registry["get_structure"]["handler"]({"path": ".", "include_explanations": True})
 
         self.assertIn("explanations", search)
+        self.assertIn("planner_trace", search)
         self.assertIn("explanations", refs)
+        self.assertIn("planner_trace", refs)
         self.assertIn("explanations", context)
+        self.assertIn("planner_trace", context)
         self.assertIn("explanations", blast)
+        self.assertIn("planner_trace", blast)
         self.assertIn("explanations", flow)
+        self.assertIn("planner_trace", flow)
         self.assertIn("explanations", impact)
+        self.assertIn("planner_trace", impact)
         self.assertTrue(str(structure).startswith("# structure_explanations"))
 
 

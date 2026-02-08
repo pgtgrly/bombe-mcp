@@ -39,6 +39,12 @@ class ReleaseGateTests(unittest.TestCase):
                     "workflow_d_latency_ms_p95": 260.0,
                 },
             ),
+            _good_entry(
+                "gold_eval",
+                {
+                    "gold_top5_hit_rate": 1.0,
+                },
+            ),
         ]
         self.assertEqual([], evaluate_release_gates(entries))
 
@@ -67,6 +73,12 @@ class ReleaseGateTests(unittest.TestCase):
                     "workflow_d_seed_hit_rate": 0.1,
                     "workflow_d_connectedness": 0.1,
                     "workflow_d_latency_ms_p95": 3000.0,
+                },
+            ),
+            _good_entry(
+                "gold_eval",
+                {
+                    "gold_top5_hit_rate": 0.2,
                 },
             ),
         ]

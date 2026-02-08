@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bombe.indexer.pipeline import full_index, incremental_index
+from bombe.indexer.semantic import backend_statuses
 from bombe.models import FileChange
 from bombe.sync.orchestrator import run_sync_cycle
 from bombe.sync.transport import FileControlPlaneTransport
@@ -102,9 +103,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Optional loop cycle cap for watch mode. 0 means run until interrupted.",
     )
+    watch_parser.add_argument(
+        "--watch-mode",
+        choices=["auto", "poll", "fs"],
+        default="auto",
+        help="Watch transport: git diff polling, filesystem events, or automatic selection.",
+    )
+    watch_parser.add_argument(
+        "--debounce-ms",
+        type=int,
+        default=250,
+        help="Debounce window for filesystem event batching.",
+    )
 
     subparsers.add_parser("status", help="Print local index status and exit.")
-    subparsers.add_parser("doctor", help="Run runtime and environment health checks.")
+    doctor_parser = subparsers.add_parser("doctor", help="Run runtime and environment health checks.")
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Apply safe automatic repairs (schema sync, queue normalization, cache epoch bootstrap).",
+    )
     parser.set_defaults(command="serve")
     return parser
 
@@ -283,6 +301,24 @@ def _is_path_writable(directory: Path) -> bool:
 
 def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    fixes_applied: list[dict[str, Any]] = []
+    if bool(getattr(args, "fix", False)):
+        db.init_schema()
+        normalized_rows = db.normalize_sync_queue_statuses()
+        cache_epoch = db.get_cache_epoch()
+        fixes_applied.append(
+            {
+                "name": "normalize_sync_queue_statuses",
+                "rows_fixed": normalized_rows,
+            }
+        )
+        fixes_applied.append(
+            {
+                "name": "cache_epoch_bootstrap",
+                "cache_epoch": cache_epoch,
+            }
+        )
+
     schema_row = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
     schema_version = int(schema_row[0]["value"]) if schema_row else 0
     checks.append(
@@ -346,6 +382,33 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
         }
     )
 
+    semantic_status = backend_statuses()
+    checks.append(
+        {
+            "name": "semantic_backends",
+            "status": "ok" if any(bool(item.get("available")) for item in semantic_status) else "degraded",
+            "detail": {"backends": semantic_status},
+        }
+    )
+
+    fs_available = _filesystem_events_available()
+    checks.append(
+        {
+            "name": "filesystem_watch_events",
+            "status": "ok" if fs_available else "degraded",
+            "detail": {"available": fs_available},
+        }
+    )
+
+    trusted_keys = db.list_trusted_signing_keys(repo_root.as_posix(), active_only=True)
+    checks.append(
+        {
+            "name": "trusted_sync_keys",
+            "status": "ok" if len(trusted_keys) > 0 else "degraded",
+            "detail": {"active_keys": len(trusted_keys)},
+        }
+    )
+
     overall_status = "ok"
     if any(check["status"] != "ok" for check in checks):
         overall_status = "degraded"
@@ -360,9 +423,74 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
         "status": overall_status,
         "repo_root": repo_root.as_posix(),
         "db_path": db.db_path.as_posix(),
+        "fixes_applied": fixes_applied,
         "checks": checks,
         "recommendations": recommendations,
     }
+
+
+def _filesystem_events_available() -> bool:
+    try:
+        from watchdog.events import FileSystemEventHandler  # type: ignore
+        from watchdog.observers import Observer  # type: ignore
+    except Exception:
+        return False
+    _ = (FileSystemEventHandler, Observer)
+    return True
+
+
+def _collect_fs_changes(
+    repo_root: Path,
+    interval_ms: int,
+    debounce_ms: int,
+) -> list[FileChange]:
+    try:
+        from watchdog.events import FileSystemEventHandler  # type: ignore
+        from watchdog.observers import Observer  # type: ignore
+    except Exception:
+        return []
+
+    changed_paths: set[str] = set()
+
+    class _Collector(FileSystemEventHandler):  # type: ignore[misc]
+        def on_any_event(self, event) -> None:  # type: ignore[no-untyped-def]
+            if getattr(event, "is_directory", False):
+                return
+            src_path = str(getattr(event, "src_path", "") or "")
+            if not src_path:
+                return
+            try:
+                rel = Path(src_path).resolve().relative_to(repo_root.resolve()).as_posix()
+            except Exception:
+                return
+            changed_paths.add(rel)
+
+            dest_path = str(getattr(event, "dest_path", "") or "")
+            if dest_path:
+                try:
+                    rel_dest = Path(dest_path).resolve().relative_to(repo_root.resolve()).as_posix()
+                    changed_paths.add(rel_dest)
+                except Exception:
+                    return
+
+    observer = Observer()
+    handler = _Collector()
+    observer.schedule(handler, repo_root.as_posix(), recursive=True)
+    observer.start()
+    try:
+        time.sleep(max(0.05, interval_ms / 1000.0))
+        if debounce_ms > 0:
+            time.sleep(debounce_ms / 1000.0)
+    finally:
+        observer.stop()
+        observer.join(timeout=2.0)
+
+    changes: list[FileChange] = []
+    for rel in sorted(changed_paths):
+        absolute = repo_root / rel
+        status = "M" if absolute.exists() else "D"
+        changes.append(FileChange(status=status, path=rel))
+    return changes
 
 
 def _run_watch(
@@ -372,7 +500,17 @@ def _run_watch(
 ) -> dict[str, Any]:
     poll_interval_ms = max(100, int(getattr(args, "poll_interval_ms", 1000)))
     max_cycles = max(0, int(getattr(args, "max_cycles", 0)))
+    debounce_ms = max(0, int(getattr(args, "debounce_ms", 250)))
     workers = int(getattr(args, "workers", 4))
+    requested_mode = str(getattr(args, "watch_mode", "auto"))
+    fs_available = _filesystem_events_available()
+    if requested_mode == "poll":
+        effective_mode = "poll"
+    elif requested_mode == "fs":
+        effective_mode = "fs" if fs_available else "poll"
+    else:
+        effective_mode = "fs" if fs_available else "poll"
+
     cycles = 0
     runs = 0
     changed_files_total = 0
@@ -382,7 +520,14 @@ def _run_watch(
 
     while True:
         cycles += 1
-        changes = get_changed_files(repo_root)
+        if effective_mode == "fs":
+            changes = _collect_fs_changes(
+                repo_root=repo_root,
+                interval_ms=poll_interval_ms,
+                debounce_ms=debounce_ms,
+            )
+        else:
+            changes = get_changed_files(repo_root)
         changed_files_total += len(changes)
         if changes:
             last_index_payload = _run_incremental_index(
@@ -403,6 +548,8 @@ def _run_watch(
                 last_sync_payload = sync_payload
         if max_cycles > 0 and cycles >= max_cycles:
             break
+        if effective_mode == "fs":
+            continue
         try:
             time.sleep(poll_interval_ms / 1000.0)
         except KeyboardInterrupt:
@@ -410,11 +557,15 @@ def _run_watch(
 
     return {
         "mode": "watch",
+        "requested_watch_mode": requested_mode,
+        "effective_watch_mode": effective_mode,
+        "filesystem_events_available": fs_available,
         "cycles": cycles,
         "index_runs": runs,
         "changed_files_seen": changed_files_total,
         "files_indexed": files_indexed_total,
         "poll_interval_ms": poll_interval_ms,
+        "debounce_ms": debounce_ms,
         "last_index": last_index_payload,
         "last_sync": last_sync_payload,
     }

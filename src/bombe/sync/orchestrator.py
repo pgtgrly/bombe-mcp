@@ -253,6 +253,11 @@ def run_sync_cycle(
 
     policy = CompatibilityPolicy(tool_version=__version__)
     resolved_signing_key = signing_key or os.getenv("BOMBE_SYNC_SIGNING_KEY")
+    resolved_signing_algorithm = os.getenv("BOMBE_SYNC_SIGNING_ALGO", "hmac-sha256").strip().lower()
+    trusted_keys = db.list_trusted_signing_keys(repo_identifier, active_only=True)
+    trusted_verification_keys = {
+        str(item["key_id"]): str(item["public_key"]) for item in trusted_keys
+    }
     client = SyncClient(
         transport=transport,
         policy=policy,
@@ -260,6 +265,8 @@ def run_sync_cycle(
         circuit_breaker=breaker,
         quarantine_store=quarantine_store,
         signing_key=resolved_signing_key,
+        signing_algorithm=resolved_signing_algorithm,
+        trusted_verification_keys=trusted_verification_keys,
     )
     try:
         queue_payload = json.dumps(asdict(delta), sort_keys=True)

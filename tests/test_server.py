@@ -19,9 +19,13 @@ class ServerCLITests(unittest.TestCase):
         self.assertEqual(args.repo, Path("."))
         self.assertEqual(args.log_level, "INFO")
         doctor_args = parser.parse_args(["doctor"])
+        doctor_fix_args = parser.parse_args(["doctor", "--fix"])
         watch_args = parser.parse_args(["watch", "--max-cycles", "1"])
+        watch_fs_args = parser.parse_args(["watch", "--watch-mode", "fs", "--max-cycles", "1"])
         self.assertEqual(doctor_args.command, "doctor")
+        self.assertTrue(bool(doctor_fix_args.fix))
         self.assertEqual(watch_args.command, "watch")
+        self.assertEqual(str(watch_fs_args.watch_mode), "fs")
         self.assertEqual(int(watch_args.max_cycles), 1)
 
     def test_index_and_status_commands_emit_json(self) -> None:
@@ -127,6 +131,29 @@ class ServerCLITests(unittest.TestCase):
             self.assertIn("status", doctor_payload)
             self.assertIn("checks", doctor_payload)
             self.assertGreaterEqual(len(doctor_payload["checks"]), 1)
+            self.assertIn("fixes_applied", doctor_payload)
+
+            doctor_fix = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "doctor",
+                    "--fix",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            doctor_fix_payload = json.loads(doctor_fix.stdout.strip())
+            self.assertIn("fixes_applied", doctor_fix_payload)
+            self.assertGreaterEqual(len(doctor_fix_payload["fixes_applied"]), 1)
 
             watch = subprocess.run(
                 [
@@ -152,6 +179,7 @@ class ServerCLITests(unittest.TestCase):
             watch_payload = json.loads(watch.stdout.strip())
             self.assertEqual(watch_payload["mode"], "watch")
             self.assertEqual(int(watch_payload["cycles"]), 1)
+            self.assertIn("effective_watch_mode", watch_payload)
 
 
 if __name__ == "__main__":

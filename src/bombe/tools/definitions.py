@@ -55,6 +55,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "file_pattern": {"type": "string"},
             "limit": {"type": "integer", "default": 20},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["query"],
     },
@@ -70,6 +71,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "depth": {"type": "integer", "default": 1, "minimum": 1, "maximum": 5},
             "include_source": {"type": "boolean", "default": False},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -82,6 +84,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_signatures_only": {"type": "boolean", "default": False},
             "expansion_depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["query"],
     },
@@ -92,6 +95,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "token_budget": {"type": "integer", "default": 4000},
             "include_signatures": {"type": "boolean", "default": True},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
     },
     "get_blast_radius": {
@@ -105,6 +109,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "max_depth": {"type": "integer", "default": 3},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -119,6 +124,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -133,6 +139,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 6},
             "include_explanations": {"type": "boolean", "default": False},
+            "include_plan": {"type": "boolean", "default": False},
         },
         "required": ["symbol_name"],
     },
@@ -162,6 +169,13 @@ def _safe_record_tool_metric(db: Database, **metric_kwargs: Any) -> None:
             metric_kwargs.get("tool_name", "unknown_tool"),
             str(exc),
         )
+
+
+def _cache_version_token(db: Database) -> str:
+    try:
+        return str(db.get_cache_epoch())
+    except Exception:
+        return "1"
 
 
 def _with_explanations(
@@ -244,16 +258,25 @@ def _instrument_handler(
     def wrapped(payload: dict[str, Any]) -> dict[str, Any] | str:
         started = time.perf_counter()
         mode = "local"
+        plan_trace: dict[str, float | str] | None = None
         try:
             if planner is not None:
-                result, mode = planner.get_or_compute(
+                result, mode, plan_trace = planner.get_or_compute_with_trace(
                     tool_name=tool_name,
                     payload=payload,
                     compute=lambda: handler(payload),
+                    version_token=_cache_version_token(db),
                 )
             else:
                 result = handler(payload)
             latency_ms = (time.perf_counter() - started) * 1000.0
+            if bool(payload.get("include_plan", False)) and isinstance(result, dict):
+                trace_payload: dict[str, float | str] = {
+                    "cache_mode": mode,
+                }
+                if plan_trace is not None:
+                    trace_payload.update(plan_trace)
+                result = {**result, "planner_trace": trace_payload}
             _safe_record_tool_metric(
                 db,
                 tool_name=tool_name,

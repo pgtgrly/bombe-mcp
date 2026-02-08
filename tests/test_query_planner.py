@@ -48,6 +48,45 @@ class QueryPlannerTests(unittest.TestCase):
         _, mode = planner.get_or_compute("a", {"x": 1}, lambda: {"v": 4})
         self.assertEqual(mode, "cache_miss")
 
+    def test_version_token_invalidates_cache(self) -> None:
+        planner = QueryPlanner(max_entries=16, ttl_seconds=30.0)
+        counter = {"calls": 0}
+
+        def _compute() -> dict[str, object]:
+            counter["calls"] += 1
+            return {"count": counter["calls"]}
+
+        _, mode_one = planner.get_or_compute(
+            "get_context",
+            {"query": "auth flow"},
+            _compute,
+            version_token="1",
+        )
+        _, mode_two = planner.get_or_compute(
+            "get_context",
+            {"query": "auth flow"},
+            _compute,
+            version_token="2",
+        )
+        self.assertEqual(mode_one, "cache_miss")
+        self.assertEqual(mode_two, "cache_miss")
+        self.assertEqual(counter["calls"], 2)
+
+    def test_trace_contains_lookup_compute_and_total(self) -> None:
+        planner = QueryPlanner(max_entries=16, ttl_seconds=30.0)
+        result, mode, trace = planner.get_or_compute_with_trace(
+            "search_symbols",
+            {"query": "auth"},
+            lambda: {"ok": True},
+            version_token="4",
+        )
+        self.assertEqual(mode, "cache_miss")
+        self.assertEqual(result, {"ok": True})
+        self.assertIn("lookup_ms", trace)
+        self.assertIn("compute_ms", trace)
+        self.assertIn("total_ms", trace)
+        self.assertEqual(str(trace["version_token"]), "4")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from bombe.query.guards import (
     MAX_CONTEXT_TOKEN_BUDGET,
     MAX_GRAPH_VISITED,
     MIN_CONTEXT_TOKEN_BUDGET,
+    adaptive_graph_cap,
     clamp_budget,
     clamp_depth,
     truncate_query,
@@ -323,6 +324,11 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         expansion_depth=clamp_depth(req.expansion_depth, maximum=MAX_CONTEXT_EXPANSION_DEPTH),
     )
     with closing(db.connect()) as conn:
+        total_symbols_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM symbols;"
+        ).fetchone()
+        total_symbols = int(total_symbols_row["count"]) if total_symbols_row else 0
+        dynamic_node_cap = adaptive_graph_cap(total_symbols, MAX_GRAPH_VISITED, floor=128)
         seeds = _pick_seeds(conn, normalized_request)
         if not seeds:
             return ContextResponse(
@@ -344,7 +350,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             conn,
             seeds,
             normalized_request.expansion_depth,
-            max_nodes=MAX_GRAPH_VISITED,
+            max_nodes=dynamic_node_cap,
         )
         symbol_ids = tuple(reached.keys())
         placeholders = ", ".join("?" for _ in symbol_ids)
@@ -401,7 +407,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         seen_bundle_keys: set[tuple[str, str, str]] = set()
         duplicate_skips = 0
         for symbol_id, topology_reason in topology_order:
-            if len(included_symbols) >= MAX_GRAPH_VISITED:
+            if len(included_symbols) >= dynamic_node_cap:
                 break
             symbol = ranked_symbols[symbol_id]
             include_full = bool(symbol["is_seed"]) and not normalized_request.include_signatures_only

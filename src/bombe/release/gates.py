@@ -33,6 +33,9 @@ SUITE_THRESHOLDS: dict[str, dict[str, tuple[str, float]]] = {
         "workflow_d_connectedness": ("min", 0.80),
         "workflow_d_latency_ms_p95": ("max", 1800.0),
     },
+    "gold_eval": {
+        "gold_top5_hit_rate": ("min", 0.95),
+    },
 }
 
 

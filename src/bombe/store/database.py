@@ -11,7 +11,7 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_STATEMENTS = (
     """
@@ -153,6 +153,18 @@ SCHEMA_STATEMENTS = (
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS trusted_signing_keys (
+        repo_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        algorithm TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        purpose TEXT NOT NULL DEFAULT 'default',
+        active INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(repo_id, key_id)
+    );
+    """,
     "CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);",
     "CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);",
@@ -166,6 +178,7 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sync_queue_repo_status ON sync_queue(repo_id, status, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_sync_events_repo_created ON sync_events(repo_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_tool_metrics_tool_created ON tool_metrics(tool_name, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_trusted_keys_repo_active ON trusted_signing_keys(repo_id, active, key_id);",
 )
 
 FTS_STATEMENTS = (
@@ -215,6 +228,8 @@ class Database:
                     self._migrate_to_v3(conn)
                 elif next_version == 4:
                     self._migrate_to_v4(conn)
+                elif next_version == 5:
+                    self._migrate_to_v5(conn)
                 self._set_schema_version(conn, next_version)
                 self._record_migration_step(
                     conn=conn,
@@ -372,6 +387,25 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_tool_metrics_tool_created ON tool_metrics(tool_name, created_at);"
         )
 
+    def _migrate_to_v5(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trusted_signing_keys (
+                repo_id TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT 'default',
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(repo_id, key_id)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trusted_keys_repo_active ON trusted_signing_keys(repo_id, active, key_id);"
+        )
+
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         row = conn.execute(
             "SELECT value FROM repo_meta WHERE key = 'schema_version';"
@@ -391,6 +425,16 @@ class Database:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             """,
             (str(version),),
+        )
+
+    def _set_repo_meta(self, conn: sqlite3.Connection, key: str, value: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO repo_meta(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            (key, value),
         )
 
     def _record_migration_step(
@@ -413,6 +457,46 @@ class Database:
         with closing(self.connect()) as conn:
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_repo_meta(self, key: str) -> str | None:
+        rows = self.query("SELECT value FROM repo_meta WHERE key = ? LIMIT 1;", (key,))
+        if not rows:
+            return None
+        return str(rows[0]["value"])
+
+    def set_repo_meta(self, key: str, value: str) -> None:
+        with closing(self.connect()) as conn:
+            self._set_repo_meta(conn, key, value)
+            conn.commit()
+
+    def get_cache_epoch(self) -> int:
+        value = self.get_repo_meta("cache_epoch")
+        if value is None:
+            self.set_repo_meta("cache_epoch", "1")
+            return 1
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = 1
+        if parsed < 1:
+            parsed = 1
+        return parsed
+
+    def bump_cache_epoch(self) -> int:
+        with closing(self.connect()) as conn:
+            current_row = conn.execute(
+                "SELECT value FROM repo_meta WHERE key = 'cache_epoch';"
+            ).fetchone()
+            current = 0
+            if current_row is not None:
+                try:
+                    current = int(current_row["value"])
+                except (TypeError, ValueError):
+                    current = 0
+            next_epoch = max(1, current + 1)
+            self._set_repo_meta(conn, "cache_epoch", str(next_epoch))
+            conn.commit()
+            return next_epoch
 
     def upsert_files(self, records: Sequence[FileRecord]) -> None:
         if not records:
@@ -826,3 +910,112 @@ class Database:
             """,
             (tool_name, max(1, limit)),
         )
+
+    def set_trusted_signing_key(
+        self,
+        repo_id: str,
+        key_id: str,
+        algorithm: str,
+        public_key: str,
+        purpose: str = "default",
+        active: bool = True,
+    ) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO trusted_signing_keys(repo_id, key_id, algorithm, public_key, purpose, active, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(repo_id, key_id) DO UPDATE SET
+                    algorithm = excluded.algorithm,
+                    public_key = excluded.public_key,
+                    purpose = excluded.purpose,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at;
+                """,
+                (repo_id, key_id, algorithm, public_key, purpose, int(bool(active))),
+            )
+            conn.commit()
+
+    def get_trusted_signing_key(self, repo_id: str, key_id: str) -> dict[str, Any] | None:
+        rows = self.query(
+            """
+            SELECT repo_id, key_id, algorithm, public_key, purpose, active, updated_at
+            FROM trusted_signing_keys
+            WHERE repo_id = ? AND key_id = ?
+            LIMIT 1;
+            """,
+            (repo_id, key_id),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "repo_id": str(row["repo_id"]),
+            "key_id": str(row["key_id"]),
+            "algorithm": str(row["algorithm"]),
+            "public_key": str(row["public_key"]),
+            "purpose": str(row["purpose"]),
+            "active": bool(int(row["active"])),
+            "updated_at": row["updated_at"],
+        }
+
+    def list_trusted_signing_keys(
+        self,
+        repo_id: str,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        if active_only:
+            rows = self.query(
+                """
+                SELECT repo_id, key_id, algorithm, public_key, purpose, active, updated_at
+                FROM trusted_signing_keys
+                WHERE repo_id = ? AND active = 1
+                ORDER BY key_id ASC;
+                """,
+                (repo_id,),
+            )
+        else:
+            rows = self.query(
+                """
+                SELECT repo_id, key_id, algorithm, public_key, purpose, active, updated_at
+                FROM trusted_signing_keys
+                WHERE repo_id = ?
+                ORDER BY key_id ASC;
+                """,
+                (repo_id,),
+            )
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "repo_id": str(row["repo_id"]),
+                    "key_id": str(row["key_id"]),
+                    "algorithm": str(row["algorithm"]),
+                    "public_key": str(row["public_key"]),
+                    "purpose": str(row["purpose"]),
+                    "active": bool(int(row["active"])),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return payload
+
+    def normalize_sync_queue_statuses(self) -> int:
+        allowed = {"queued", "retry", "pushed", "failed"}
+        with closing(self.connect()) as conn:
+            rows = conn.execute("SELECT id, status FROM sync_queue;").fetchall()
+            to_fix = [
+                int(row["id"])
+                for row in rows
+                if str(row["status"]) not in allowed
+            ]
+            for queue_id in to_fix:
+                conn.execute(
+                    """
+                    UPDATE sync_queue
+                    SET status = 'retry', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?;
+                    """,
+                    (queue_id,),
+                )
+            conn.commit()
+            return len(to_fix)

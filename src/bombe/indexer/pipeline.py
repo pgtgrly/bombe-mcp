@@ -10,6 +10,7 @@ from bombe.indexer.filesystem import compute_content_hash, detect_language, iter
 from bombe.indexer.imports import resolve_imports
 from bombe.indexer.pagerank import recompute_pagerank
 from bombe.indexer.parser import parse_file
+from bombe.indexer.semantic import load_receiver_type_hints
 from bombe.indexer.symbols import extract_symbols
 from bombe.models import FileChange, FileRecord, ImportRecord, IndexStats
 from bombe.models import ParsedUnit, SymbolRecord
@@ -139,6 +140,10 @@ def _rebuild_dependencies(repo_root: Path, db: Database) -> tuple[int, int]:
             file_symbols=symbols_by_file.get(file_record.path, []),
             candidate_symbols=all_symbols,
             symbol_id_lookup=qualified_to_id,
+            semantic_receiver_type_hints=load_receiver_type_hints(
+                repo_root=repo_root,
+                relative_path=file_record.path,
+            ),
         )
         combined_edges = [*import_edges, *call_edges]
         edge_count += len(combined_edges)
@@ -154,6 +159,7 @@ def full_index(repo_root: Path, db: Database, workers: int = 4) -> IndexStats:
     files_seen, file_records = _scan_repo_files(repo_root)
     db.upsert_files(file_records)
     symbols_indexed, edges_indexed = _rebuild_dependencies(repo_root, db)
+    db.bump_cache_epoch()
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return IndexStats(
@@ -200,6 +206,7 @@ def incremental_index(repo_root: Path, db: Database, changes: list[FileChange]) 
         files_indexed += 1
 
     symbols_indexed, edges_indexed = _rebuild_dependencies(repo_root, db)
+    db.bump_cache_epoch()
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return IndexStats(
         files_seen=files_seen,

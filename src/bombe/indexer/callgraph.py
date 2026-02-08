@@ -431,6 +431,7 @@ def _resolve_targets(
     alias_hints: dict[str, set[str]],
     receiver_type_hints: set[str],
     lexical_receiver_type_hints: set[str],
+    semantic_receiver_type_hints: set[str],
 ) -> tuple[list[SymbolRecord], float]:
     callee_name = callsite.callee_name
     candidate_names = {callee_name}
@@ -452,6 +453,7 @@ def _resolve_targets(
 
     combined_type_hints = set(receiver_type_hints)
     combined_type_hints.update(lexical_receiver_type_hints)
+    combined_type_hints.update(semantic_receiver_type_hints)
     if combined_type_hints:
         type_tokens: set[str] = set()
         for hint in combined_type_hints:
@@ -531,6 +533,7 @@ def build_call_edges(
     file_symbols: list[SymbolRecord],
     candidate_symbols: list[SymbolRecord],
     symbol_id_lookup: dict[tuple[str, str], int] | None = None,
+    semantic_receiver_type_hints: dict[tuple[int, str], set[str]] | None = None,
 ) -> list[EdgeRecord]:
     callsites = _extract_calls(parsed)
     hints = _import_hints(parsed.source)
@@ -551,6 +554,14 @@ def build_call_edges(
             alias_hints,
             _receiver_types_for_call(caller, callsite, receiver_hint_blocks),
             _lexical_receiver_type_hints(parsed, callsite.receiver_name, callsite.line_number),
+            (
+                set(
+                    (semantic_receiver_type_hints or {}).get(
+                        (callsite.line_number, str(callsite.receiver_name or "").strip()),
+                        set(),
+                    )
+                )
+            ),
         )
         for target in targets:
             if symbol_id_lookup is None:

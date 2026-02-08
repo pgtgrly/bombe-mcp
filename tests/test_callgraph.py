@@ -525,6 +525,55 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(len(caller_edges), 1)
             self.assertEqual(caller_edges[0].target_id, symbol_id("app.main.SearchService.run"))
 
+    def test_semantic_receiver_hints_override_ambiguous_method_targets(self) -> None:
+        source = (
+            "def caller():\n"
+            "    return svc.run()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=1,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.SearchService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=10,
+                    end_line=11,
+                ),
+                SymbolRecord(
+                    name="run",
+                    qualified_name="app.service.AuditService.run",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=20,
+                    end_line=21,
+                ),
+            ]
+            edges = build_call_edges(
+                parsed,
+                file_symbols,
+                file_symbols,
+                semantic_receiver_type_hints={(2, "svc"): {"SearchService"}},
+            )
+            caller_id = symbol_id("app.service.caller")
+            caller_edges = [edge for edge in edges if edge.source_id == caller_id]
+            self.assertEqual(len(caller_edges), 1)
+            self.assertEqual(
+                caller_edges[0].target_id,
+                symbol_id("app.service.SearchService.run"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

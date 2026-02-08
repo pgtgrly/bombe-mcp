@@ -1,0 +1,16 @@
+{
+  "queries": [
+    {
+      "query": "authenticate",
+      "expected": ["modules.security.auth.authenticate"]
+    },
+    {
+      "query": "service_api",
+      "expected": ["modules.security.api.service_api"]
+    },
+    {
+      "query": "runPipeline",
+      "expected": ["plugins.ingest.pipeline.runPipeline"]
+    }
+  ]
+}

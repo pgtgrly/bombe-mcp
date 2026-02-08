@@ -20,6 +20,9 @@ Hybrid mode must never block local query serving.
   - circuit breaker
   - artifact quarantine
   - optional HMAC artifact signing with `BOMBE_SYNC_SIGNING_KEY`
+  - algorithm selection (`BOMBE_SYNC_SIGNING_ALGO=hmac-sha256|ed25519`)
+  - key identity via `BOMBE_SYNC_KEY_ID`
+  - repository trust policy via `trusted_signing_keys`
 
 ## Operating sequence
 
@@ -43,6 +46,8 @@ Hybrid mode must never block local query serving.
   - add artifact to quarantine store and do not apply.
 - Signature mismatch (when signing is enabled):
   - add artifact to quarantine store and do not apply.
+- Untrusted signing key id:
+  - degrade to local fallback and quarantine artifact.
 - Repeated failures:
   - circuit breaker opens and blocks new remote attempts until reset timeout.
 

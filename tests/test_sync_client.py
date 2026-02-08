@@ -199,6 +199,76 @@ class SyncClientTests(unittest.TestCase):
         self.assertIsNotNone(result.artifact)
         self.assertEqual(result.reason, "pulled")
 
+    def test_pull_artifact_untrusted_key_fails_for_ed25519(self) -> None:
+        artifact = _build_artifact(
+            with_checksum=True,
+        )
+        artifact = replace(
+            artifact,
+            signature_algo="ed25519",
+            signing_key_id="team-key",
+            signature="deadbeef",
+            checksum=None,
+        )
+        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
+        client = SyncClient(
+            transport=_FakeTransport(artifact=artifact),
+            policy=CompatibilityPolicy(tool_version="0.1.0"),
+            timeout_seconds=0.2,
+            trusted_verification_keys={},
+        )
+        self.addCleanup(client.close)
+        result = client.pull_artifact("repo", "snap_1", "snap_0")
+        self.assertIsNone(result.artifact)
+        self.assertEqual(result.reason, "signature_untrusted_key")
+
+    def test_pull_artifact_ed25519_signature_with_trusted_key_succeeds(self) -> None:
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        except Exception:
+            self.skipTest("cryptography is not installed")
+
+        private_key = Ed25519PrivateKey.generate()
+        private_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        public_bytes = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
+        artifact = _build_artifact(with_checksum=True)
+        artifact = replace(
+            artifact,
+            signature_algo="ed25519",
+            signing_key_id="team-key",
+            signature=None,
+        )
+        artifact = replace(
+            artifact,
+            signature=build_artifact_signature(
+                artifact,
+                private_bytes.hex(),
+                algorithm="ed25519",
+            ),
+        )
+        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
+
+        client = SyncClient(
+            transport=_FakeTransport(artifact=artifact),
+            policy=CompatibilityPolicy(tool_version="0.1.0"),
+            timeout_seconds=0.2,
+            signing_algorithm="ed25519",
+            trusted_verification_keys={"team-key": public_bytes.hex()},
+        )
+        self.addCleanup(client.close)
+        result = client.pull_artifact("repo", "snap_1", "snap_0")
+        self.assertIsNotNone(result.artifact)
+        self.assertEqual(result.reason, "pulled")
+
     def test_circuit_breaker_opens_and_recovers(self) -> None:
         transport = _FakeTransport(push_error=RuntimeError("unavailable"))
         breaker = CircuitBreaker(failure_threshold=2, reset_timeout_seconds=0.01)

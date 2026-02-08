@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 
-from bombe.query.guards import MAX_FLOW_DEPTH, MAX_GRAPH_EDGES, MAX_GRAPH_VISITED, clamp_depth, truncate_query
+from bombe.query.guards import (
+    MAX_FLOW_DEPTH,
+    MAX_GRAPH_EDGES,
+    MAX_GRAPH_VISITED,
+    adaptive_graph_cap,
+    clamp_depth,
+    truncate_query,
+)
 from bombe.store.database import Database
 
 
@@ -31,6 +38,12 @@ def trace_data_flow(
     normalized_symbol = truncate_query(symbol_name)
     bounded_depth = clamp_depth(max_depth, maximum=MAX_FLOW_DEPTH)
     with closing(db.connect()) as conn:
+        total_symbols_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM symbols;"
+        ).fetchone()
+        total_symbols = int(total_symbols_row["count"]) if total_symbols_row else 0
+        dynamic_visited_cap = adaptive_graph_cap(total_symbols, MAX_GRAPH_VISITED, floor=128)
+        dynamic_edge_cap = max(256, min(MAX_GRAPH_EDGES, dynamic_visited_cap * 2))
         target = _resolve_symbol(conn, normalized_symbol)
         if target is None:
             raise ValueError(f"Symbol not found: {normalized_symbol}")
@@ -50,7 +63,7 @@ def trace_data_flow(
         }
 
         while queue:
-            if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+            if len(paths) >= dynamic_edge_cap or len(nodes) >= dynamic_visited_cap:
                 break
             current_id, depth, _role = queue.popleft()
             if depth >= bounded_depth:
@@ -70,7 +83,7 @@ def trace_data_flow(
                     (current_id,),
                 ).fetchall()
                 for row in upstream_rows:
-                    if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+                    if len(paths) >= dynamic_edge_cap or len(nodes) >= dynamic_visited_cap:
                         break
                     neighbor_id = int(row["neighbor_id"])
                     nodes.setdefault(
@@ -112,7 +125,7 @@ def trace_data_flow(
                     (current_id,),
                 ).fetchall()
                 for row in downstream_rows:
-                    if len(paths) >= MAX_GRAPH_EDGES or len(nodes) >= MAX_GRAPH_VISITED:
+                    if len(paths) >= dynamic_edge_cap or len(nodes) >= dynamic_visited_cap:
                         break
                     neighbor_id = int(row["neighbor_id"])
                     nodes.setdefault(

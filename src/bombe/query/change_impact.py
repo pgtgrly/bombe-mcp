@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 
-from bombe.query.guards import MAX_GRAPH_EDGES, MAX_GRAPH_VISITED, MAX_IMPACT_DEPTH, clamp_depth, truncate_query
+from bombe.query.guards import (
+    MAX_GRAPH_EDGES,
+    MAX_GRAPH_VISITED,
+    MAX_IMPACT_DEPTH,
+    adaptive_graph_cap,
+    clamp_depth,
+    truncate_query,
+)
 from bombe.store.database import Database
 
 
@@ -40,6 +47,12 @@ def change_impact(
     normalized_symbol = truncate_query(symbol_name)
     bounded_depth = clamp_depth(max_depth, maximum=MAX_IMPACT_DEPTH)
     with closing(db.connect()) as conn:
+        total_symbols_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM symbols;"
+        ).fetchone()
+        total_symbols = int(total_symbols_row["count"]) if total_symbols_row else 0
+        dynamic_visited_cap = adaptive_graph_cap(total_symbols, MAX_GRAPH_VISITED, floor=128)
+        dynamic_edge_cap = max(256, min(MAX_GRAPH_EDGES, dynamic_visited_cap * 2))
         target = _resolve_symbol(conn, normalized_symbol)
         if target is None:
             raise ValueError(f"Symbol not found: {normalized_symbol}")
@@ -51,7 +64,7 @@ def change_impact(
         transitive_callers: list[dict[str, object]] = []
 
         while queue:
-            if len(direct_callers) + len(transitive_callers) >= MAX_GRAPH_EDGES:
+            if len(direct_callers) + len(transitive_callers) >= dynamic_edge_cap:
                 break
             current, depth = queue.popleft()
             if depth >= bounded_depth:
@@ -68,12 +81,12 @@ def change_impact(
                 (current,),
             ).fetchall()
             for row in rows:
-                if len(direct_callers) + len(transitive_callers) >= MAX_GRAPH_EDGES:
+                if len(direct_callers) + len(transitive_callers) >= dynamic_edge_cap:
                     break
                 source_id = int(row["source_id"])
                 if source_id in visited:
                     continue
-                if len(visited) >= MAX_GRAPH_VISITED:
+                if len(visited) >= dynamic_visited_cap:
                     break
                 visited.add(source_id)
                 next_depth = depth + 1

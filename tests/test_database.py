@@ -29,7 +29,7 @@ class DatabaseTests(unittest.TestCase):
             version = db.query(
                 "SELECT value FROM repo_meta WHERE key = 'schema_version';"
             )
-            self.assertEqual(version[0]["value"], "4")
+            self.assertEqual(version[0]["value"], "5")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,7 +153,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "4")
+            self.assertEqual(version[0]["value"], "5")
             fts_table = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
             )
@@ -163,7 +163,7 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(rows[0]["name"], "run")
                 self.assertEqual(rows[0]["qualified_name"], "src.mod.run")
 
-    def test_init_schema_migrates_from_v3_to_v4_state_tables(self) -> None:
+    def test_init_schema_migrates_from_v4_to_v5_state_tables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(Path(tmpdir) / "bombe.db")
             db.init_schema()
@@ -171,31 +171,31 @@ class DatabaseTests(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT INTO repo_meta(key, value)
-                    VALUES('schema_version', '3')
+                    VALUES('schema_version', '4')
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                     """
                 )
-                conn.execute("DROP TABLE IF EXISTS sync_queue;")
+                conn.execute("DROP TABLE IF EXISTS trusted_signing_keys;")
                 conn.commit()
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "4")
+            self.assertEqual(version[0]["value"], "5")
             table_rows = db.query(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_queue';"
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trusted_signing_keys';"
             )
             self.assertEqual(len(table_rows), 1)
             migration_rows = db.query(
                 """
                 SELECT from_version, to_version, status
                 FROM migration_history
-                WHERE to_version = 4
+                WHERE to_version = 5
                 ORDER BY id DESC
                 LIMIT 1;
                 """
             )
             self.assertEqual(len(migration_rows), 1)
-            self.assertEqual(int(migration_rows[0]["from_version"]), 3)
+            self.assertEqual(int(migration_rows[0]["from_version"]), 4)
             self.assertEqual(str(migration_rows[0]["status"]), "success")
 
     def test_backup_and_restore_round_trip(self) -> None:
@@ -269,6 +269,36 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(len(metrics), 1)
             self.assertEqual(str(metrics[0]["tool_name"]), "search_symbols")
             self.assertEqual(int(metrics[0]["result_size"]), 3)
+
+            cache_epoch = db.get_cache_epoch()
+            self.assertGreaterEqual(cache_epoch, 1)
+            bumped_epoch = db.bump_cache_epoch()
+            self.assertGreater(bumped_epoch, cache_epoch)
+
+            db.set_trusted_signing_key(
+                repo_id="repo",
+                key_id="main",
+                algorithm="hmac-sha256",
+                public_key="secret-key",
+                purpose="default",
+                active=True,
+            )
+            key = db.get_trusted_signing_key("repo", "main")
+            self.assertIsNotNone(key)
+            self.assertEqual(key["algorithm"], "hmac-sha256")
+            keys = db.list_trusted_signing_keys("repo", active_only=True)
+            self.assertEqual(len(keys), 1)
+
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO sync_queue(repo_id, local_snapshot, payload_json, status)
+                    VALUES ('repo', 'snap_2', '{}', 'bogus');
+                    """
+                )
+                conn.commit()
+            fixed = db.normalize_sync_queue_statuses()
+            self.assertGreaterEqual(fixed, 1)
 
 
 if __name__ == "__main__":

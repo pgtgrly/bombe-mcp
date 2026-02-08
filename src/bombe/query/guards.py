@@ -36,3 +36,9 @@ def clamp_limit(value: int, *, maximum: int) -> int:
 def truncate_query(query: str) -> str:
     stripped = query.strip()
     return stripped[:MAX_QUERY_LENGTH]
+
+
+def adaptive_graph_cap(total_symbols: int, base_cap: int, floor: int = 200) -> int:
+    bounded_total = max(0, int(total_symbols))
+    estimated = max(floor, int(max(1, bounded_total) * 0.2))
+    return clamp_int(estimated, floor, base_cap)

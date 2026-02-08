@@ -40,6 +40,8 @@ class SyncTransportTests(unittest.TestCase):
             self.assertIsNotNone(artifact)
             assert artifact is not None
             self.assertIsNotNone(artifact.signature)
+            self.assertEqual(artifact.signature_algo, "hmac-sha256")
+            self.assertEqual(artifact.signing_key_id, "local")
             self.assertTrue(validate_artifact_signature(artifact, "secret"))
 
 
