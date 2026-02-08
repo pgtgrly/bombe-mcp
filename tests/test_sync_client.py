@@ -247,6 +247,7 @@ class SyncClientTests(unittest.TestCase):
             signing_key_id="team-key",
             signature=None,
         )
+        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
         artifact = replace(
             artifact,
             signature=build_artifact_signature(
@@ -255,7 +256,6 @@ class SyncClientTests(unittest.TestCase):
                 algorithm="ed25519",
             ),
         )
-        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
 
         client = SyncClient(
             transport=_FakeTransport(artifact=artifact),

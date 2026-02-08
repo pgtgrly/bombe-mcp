@@ -32,6 +32,27 @@ class FilesystemTests(unittest.TestCase):
             files = sorted(path.relative_to(root).as_posix() for path in iter_repo_files(root))
             self.assertEqual(files, ["src.py"])
 
+    def test_iter_repo_files_supports_bombeignore_and_include_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".bombeignore").write_text("tmp/\n", encoding="utf-8")
+            (root / "tmp").mkdir()
+            (root / "tmp" / "ignored.py").write_text("print('x')\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "a.py").write_text("print('a')\n", encoding="utf-8")
+            (root / "src" / "b.py").write_text("print('b')\n", encoding="utf-8")
+            (root / "src" / "main.go").write_text("package main\n", encoding="utf-8")
+
+            included = sorted(
+                path.relative_to(root).as_posix()
+                for path in iter_repo_files(
+                    root,
+                    include_patterns=["src/*.py"],
+                    exclude_patterns=["*b.py"],
+                )
+            )
+            self.assertEqual(included, ["src/a.py"])
+
     def test_detect_language_uses_extension_mapping(self) -> None:
         self.assertEqual(detect_language(Path("src/main.py")), "python")
         self.assertEqual(detect_language(Path("src/service.java")), "java")

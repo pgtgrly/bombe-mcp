@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bombe.server import build_parser
+from bombe.server import _filesystem_events_available, build_parser
 
 
 class ServerCLITests(unittest.TestCase):
@@ -18,11 +18,24 @@ class ServerCLITests(unittest.TestCase):
         self.assertEqual(args.command, "serve")
         self.assertEqual(args.repo, Path("."))
         self.assertEqual(args.log_level, "INFO")
+        self.assertEqual(str(args.runtime_profile), "default")
+        self.assertEqual(int(args.diagnostics_limit), 50)
+        self.assertEqual(list(args.include), [])
+        self.assertEqual(list(args.exclude), [])
         doctor_args = parser.parse_args(["doctor"])
+        diagnostics_args = parser.parse_args(["diagnostics", "--run-id", "run_1"])
+        preflight_strict_args = parser.parse_args(["--runtime-profile", "strict", "preflight"])
+        include_exclude_args = parser.parse_args(["--include", "src/*.py", "--exclude", "*test*", "index-full"])
         doctor_fix_args = parser.parse_args(["doctor", "--fix"])
         watch_args = parser.parse_args(["watch", "--max-cycles", "1"])
         watch_fs_args = parser.parse_args(["watch", "--watch-mode", "fs", "--max-cycles", "1"])
         self.assertEqual(doctor_args.command, "doctor")
+        self.assertEqual(diagnostics_args.command, "diagnostics")
+        self.assertEqual(str(diagnostics_args.run_id), "run_1")
+        self.assertEqual(preflight_strict_args.command, "preflight")
+        self.assertEqual(str(preflight_strict_args.runtime_profile), "strict")
+        self.assertEqual(include_exclude_args.include, ["src/*.py"])
+        self.assertEqual(include_exclude_args.exclude, ["*test*"])
         self.assertTrue(bool(doctor_fix_args.fix))
         self.assertEqual(watch_args.command, "watch")
         self.assertEqual(str(watch_fs_args.watch_mode), "fs")
@@ -62,8 +75,32 @@ class ServerCLITests(unittest.TestCase):
             full_payload = json.loads(full.stdout.strip())
             self.assertEqual(full_payload["mode"], "full")
             self.assertGreaterEqual(int(full_payload["files_indexed"]), 1)
+            self.assertIn("run_id", full_payload)
+            self.assertIn("diagnostics", full_payload)
             self.assertIn("sync", full_payload)
             self.assertEqual(full_payload["sync"]["push"]["reason"], "pushed")
+
+            preflight = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "preflight",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            preflight_payload = json.loads(preflight.stdout.strip())
+            self.assertIn("status", preflight_payload)
+            self.assertIn("checks", preflight_payload)
+            self.assertEqual(str(preflight_payload["runtime_profile"]), "default")
 
             incremental = subprocess.run(
                 [
@@ -109,6 +146,8 @@ class ServerCLITests(unittest.TestCase):
             self.assertIn("counts", status_payload)
             self.assertGreaterEqual(int(status_payload["counts"]["files"]), 1)
             self.assertGreaterEqual(int(status_payload["counts"]["artifact_pins"]), 1)
+            self.assertIn("indexing_diagnostics_summary", status_payload)
+            self.assertIn("recent_indexing_diagnostics", status_payload)
 
             doctor = subprocess.run(
                 [
@@ -132,6 +171,8 @@ class ServerCLITests(unittest.TestCase):
             self.assertIn("checks", doctor_payload)
             self.assertGreaterEqual(len(doctor_payload["checks"]), 1)
             self.assertIn("fixes_applied", doctor_payload)
+            self.assertIn("indexing_diagnostics_summary", doctor_payload)
+            self.assertIn("recent_indexing_diagnostics", doctor_payload)
 
             doctor_fix = subprocess.run(
                 [
@@ -180,6 +221,60 @@ class ServerCLITests(unittest.TestCase):
             self.assertEqual(watch_payload["mode"], "watch")
             self.assertEqual(int(watch_payload["cycles"]), 1)
             self.assertIn("effective_watch_mode", watch_payload)
+
+            diagnostics = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "diagnostics",
+                    "--run-id",
+                    str(full_payload["run_id"]),
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            diagnostics_payload = json.loads(diagnostics.stdout.strip())
+            self.assertEqual(str(diagnostics_payload["filters"]["run_id"]), str(full_payload["run_id"]))
+            self.assertIn("summary", diagnostics_payload)
+            self.assertIn("diagnostics", diagnostics_payload)
+
+            watch_fs = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "watch",
+                    "--watch-mode",
+                    "fs",
+                    "--max-cycles",
+                    "1",
+                    "--poll-interval-ms",
+                    "100",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if _filesystem_events_available():
+                self.assertEqual(watch_fs.returncode, 0)
+                watch_fs_payload = json.loads(watch_fs.stdout.strip())
+                self.assertEqual(str(watch_fs_payload["effective_watch_mode"]), "fs")
+            else:
+                self.assertNotEqual(watch_fs.returncode, 0)
+                self.assertIn("watchdog filesystem events are unavailable", watch_fs.stderr)
 
 
 if __name__ == "__main__":

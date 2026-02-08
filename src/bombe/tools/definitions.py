@@ -143,6 +143,43 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["symbol_name"],
     },
+    "get_indexing_diagnostics": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string"},
+            "stage": {"type": "string"},
+            "severity": {"type": "string"},
+            "limit": {"type": "integer", "default": 50},
+            "include_summary": {"type": "boolean", "default": True},
+        },
+    },
+    "get_server_status": {
+        "type": "object",
+        "properties": {
+            "diagnostics_limit": {"type": "integer", "default": 20},
+            "metrics_limit": {"type": "integer", "default": 20},
+        },
+    },
+    "estimate_context_size": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "entry_points": {"type": "array", "items": {"type": "string"}},
+            "token_budget": {"type": "integer", "default": 8000},
+            "expansion_depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+        },
+        "required": ["query"],
+    },
+    "get_context_summary": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "entry_points": {"type": "array", "items": {"type": "string"}},
+            "token_budget": {"type": "integer", "default": 4000},
+            "expansion_depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+        },
+        "required": ["query"],
+    },
 }
 
 
@@ -410,8 +447,175 @@ def _change_impact_handler(db: Database, payload: dict[str, Any]) -> dict[str, A
     return _with_explanations("change_impact", payload, base)
 
 
+def _indexing_diagnostics_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = max(1, int(payload.get("limit", 50)))
+    run_id_raw = payload.get("run_id")
+    stage_raw = payload.get("stage")
+    severity_raw = payload.get("severity")
+    run_id = str(run_id_raw) if run_id_raw else None
+    stage = str(stage_raw) if stage_raw else None
+    severity = str(severity_raw) if severity_raw else None
+    diagnostics = db.list_indexing_diagnostics(
+        limit=limit,
+        run_id=run_id,
+        stage=stage,
+        severity=severity,
+    )
+    response = {
+        "diagnostics": diagnostics,
+        "count": len(diagnostics),
+        "filters": {
+            "run_id": run_id,
+            "stage": stage,
+            "severity": severity,
+            "limit": limit,
+        },
+    }
+    if bool(payload.get("include_summary", True)):
+        response["summary"] = db.summarize_indexing_diagnostics(run_id=run_id)
+    return response
+
+
+def _server_status_handler(
+    db: Database,
+    repo_root: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics_limit = max(1, int(payload.get("diagnostics_limit", 20)))
+    metrics_limit = max(1, int(payload.get("metrics_limit", 20)))
+    file_rows = db.query("SELECT COUNT(*) AS count FROM files;")
+    symbol_rows = db.query("SELECT COUNT(*) AS count FROM symbols;")
+    edge_rows = db.query("SELECT COUNT(*) AS count FROM edges;")
+    queued_rows = db.query(
+        "SELECT COUNT(*) AS count FROM sync_queue WHERE status IN ('queued', 'retry');"
+    )
+    diagnostics_summary = db.summarize_indexing_diagnostics()
+    return {
+        "repo_root": repo_root,
+        "db_path": db.db_path.as_posix(),
+        "counts": {
+            "files": int(file_rows[0]["count"]) if file_rows else 0,
+            "symbols": int(symbol_rows[0]["count"]) if symbol_rows else 0,
+            "edges": int(edge_rows[0]["count"]) if edge_rows else 0,
+            "sync_queue_pending": int(queued_rows[0]["count"]) if queued_rows else 0,
+            "indexing_diagnostics_total": int(diagnostics_summary.get("total", 0)),
+            "indexing_diagnostics_errors": int(
+                diagnostics_summary.get("by_severity", {}).get("error", 0)
+            ),
+        },
+        "indexing_diagnostics_summary": diagnostics_summary,
+        "recent_indexing_diagnostics": db.list_indexing_diagnostics(limit=diagnostics_limit),
+        "recent_tool_metrics": db.query(
+            """
+            SELECT tool_name, latency_ms, success, mode, result_size, error_message, created_at
+            FROM tool_metrics
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (metrics_limit,),
+        ),
+    }
+
+
+def _estimate_context_size_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    entry_points = list(payload.get("entry_points", []))[:MAX_CONTEXT_SEEDS]
+    token_budget = clamp_budget(
+        int(payload.get("token_budget", 8000)),
+        minimum=MIN_CONTEXT_TOKEN_BUDGET,
+        maximum=MAX_CONTEXT_TOKEN_BUDGET,
+    )
+    response = get_context(
+        db,
+        ContextRequest(
+            query=truncate_query(str(payload["query"])),
+            entry_points=entry_points,
+            token_budget=token_budget,
+            include_signatures_only=True,
+            expansion_depth=clamp_depth(
+                int(payload.get("expansion_depth", 2)),
+                maximum=MAX_CONTEXT_EXPANSION_DEPTH,
+            ),
+        ),
+    )
+    bundle = response.payload.get("context_bundle", {})
+    estimated_tokens = int(bundle.get("tokens_used", 0)) if isinstance(bundle, dict) else 0
+    symbols_estimated = int(bundle.get("symbols_included", 0)) if isinstance(bundle, dict) else 0
+    return {
+        "query": str(payload["query"]),
+        "estimated_tokens": estimated_tokens,
+        "token_budget": token_budget,
+        "fits_budget": estimated_tokens <= token_budget,
+        "symbols_estimated": symbols_estimated,
+        "estimation_mode": "signature_only_topology",
+    }
+
+
+def _context_summary_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    entry_points = list(payload.get("entry_points", []))[:MAX_CONTEXT_SEEDS]
+    token_budget = clamp_budget(
+        int(payload.get("token_budget", 4000)),
+        minimum=MIN_CONTEXT_TOKEN_BUDGET,
+        maximum=MAX_CONTEXT_TOKEN_BUDGET,
+    )
+    response = get_context(
+        db,
+        ContextRequest(
+            query=truncate_query(str(payload["query"])),
+            entry_points=entry_points,
+            token_budget=token_budget,
+            include_signatures_only=True,
+            expansion_depth=clamp_depth(
+                int(payload.get("expansion_depth", 2)),
+                maximum=MAX_CONTEXT_EXPANSION_DEPTH,
+            ),
+        ),
+    )
+    bundle = response.payload.get("context_bundle", {})
+    files = bundle.get("files", []) if isinstance(bundle, dict) else []
+    module_summaries: list[dict[str, Any]] = []
+    for file_entry in files if isinstance(files, list) else []:
+        if not isinstance(file_entry, dict):
+            continue
+        path = str(file_entry.get("path", ""))
+        symbols = file_entry.get("symbols", [])
+        if not isinstance(symbols, list):
+            symbols = []
+        kinds: dict[str, int] = {}
+        top_symbols: list[str] = []
+        for symbol in symbols:
+            if not isinstance(symbol, dict):
+                continue
+            kind = str(symbol.get("kind", "unknown"))
+            kinds[kind] = kinds.get(kind, 0) + 1
+            name = str(symbol.get("name", ""))
+            if name and len(top_symbols) < 8:
+                top_symbols.append(name)
+        module_summaries.append(
+            {
+                "path": path,
+                "symbol_count": len(symbols),
+                "kinds": kinds,
+                "top_symbols": top_symbols,
+            }
+        )
+    module_summaries.sort(key=lambda item: item["path"])
+    return {
+        "query": str(payload["query"]),
+        "summary": bundle.get("summary", "") if isinstance(bundle, dict) else "",
+        "selection_strategy": (
+            bundle.get("selection_strategy", "seeded_topology_then_rank")
+            if isinstance(bundle, dict)
+            else "seeded_topology_then_rank"
+        ),
+        "relationship_map": bundle.get("relationship_map", "") if isinstance(bundle, dict) else "",
+        "module_summaries": module_summaries,
+        "tokens_used": int(bundle.get("tokens_used", 0)) if isinstance(bundle, dict) else 0,
+        "token_budget": token_budget,
+        "symbols_included": int(bundle.get("symbols_included", 0)) if isinstance(bundle, dict) else 0,
+    }
+
+
 def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
-    del repo_root
     planner = QueryPlanner(max_entries=1024, ttl_seconds=30.0)
     search_handler = _instrument_handler(
         db,
@@ -455,6 +659,30 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
         lambda payload: _change_impact_handler(db, payload),
         planner=planner,
     )
+    diagnostics_handler = _instrument_handler(
+        db,
+        "get_indexing_diagnostics",
+        lambda payload: _indexing_diagnostics_handler(db, payload),
+        planner=None,
+    )
+    status_handler = _instrument_handler(
+        db,
+        "get_server_status",
+        lambda payload: _server_status_handler(db, repo_root, payload),
+        planner=None,
+    )
+    estimate_context_handler = _instrument_handler(
+        db,
+        "estimate_context_size",
+        lambda payload: _estimate_context_size_handler(db, payload),
+        planner=planner,
+    )
+    context_summary_handler = _instrument_handler(
+        db,
+        "get_context_summary",
+        lambda payload: _context_summary_handler(db, payload),
+        planner=planner,
+    )
     return {
         "search_symbols": {
             "description": "Search for symbols by name, kind, and file path.",
@@ -490,6 +718,26 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
             "description": "Estimate change impact with callgraph and type-dependency analysis.",
             "input_schema": TOOL_SCHEMAS["change_impact"],
             "handler": impact_handler,
+        },
+        "get_indexing_diagnostics": {
+            "description": "List parse and indexing diagnostics with optional run/stage filters.",
+            "input_schema": TOOL_SCHEMAS["get_indexing_diagnostics"],
+            "handler": diagnostics_handler,
+        },
+        "get_server_status": {
+            "description": "Return local index health, counters, and recent diagnostics.",
+            "input_schema": TOOL_SCHEMAS["get_server_status"],
+            "handler": status_handler,
+        },
+        "estimate_context_size": {
+            "description": "Estimate context token usage before fetching full context payloads.",
+            "input_schema": TOOL_SCHEMAS["estimate_context_size"],
+            "handler": estimate_context_handler,
+        },
+        "get_context_summary": {
+            "description": "Return module-level context summaries for a query.",
+            "input_schema": TOOL_SCHEMAS["get_context_summary"],
+            "handler": context_summary_handler,
         },
     }
 

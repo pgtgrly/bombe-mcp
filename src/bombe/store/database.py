@@ -11,7 +11,7 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_STATEMENTS = (
     """
@@ -154,6 +154,20 @@ SCHEMA_STATEMENTS = (
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS indexing_diagnostics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        category TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'error',
+        file_path TEXT,
+        language TEXT,
+        message TEXT NOT NULL,
+        hint TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS trusted_signing_keys (
         repo_id TEXT NOT NULL,
         key_id TEXT NOT NULL,
@@ -178,6 +192,10 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sync_queue_repo_status ON sync_queue(repo_id, status, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_sync_events_repo_created ON sync_events(repo_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_tool_metrics_tool_created ON tool_metrics(tool_name, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_index_diag_run_created ON indexing_diagnostics(run_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_index_diag_stage_category ON indexing_diagnostics(stage, category);",
+    "CREATE INDEX IF NOT EXISTS idx_index_diag_file_created ON indexing_diagnostics(file_path, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_index_diag_severity_created ON indexing_diagnostics(severity, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_trusted_keys_repo_active ON trusted_signing_keys(repo_id, active, key_id);",
 )
 
@@ -230,6 +248,8 @@ class Database:
                     self._migrate_to_v4(conn)
                 elif next_version == 5:
                     self._migrate_to_v5(conn)
+                elif next_version == 6:
+                    self._migrate_to_v6(conn)
                 self._set_schema_version(conn, next_version)
                 self._record_migration_step(
                     conn=conn,
@@ -406,6 +426,36 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_trusted_keys_repo_active ON trusted_signing_keys(repo_id, active, key_id);"
         )
 
+    def _migrate_to_v6(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS indexing_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'error',
+                file_path TEXT,
+                language TEXT,
+                message TEXT NOT NULL,
+                hint TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_diag_run_created ON indexing_diagnostics(run_id, created_at);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_diag_stage_category ON indexing_diagnostics(stage, category);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_diag_file_created ON indexing_diagnostics(file_path, created_at);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_diag_severity_created ON indexing_diagnostics(severity, created_at);"
+        )
+
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         row = conn.execute(
             "SELECT value FROM repo_meta WHERE key = 'schema_version';"
@@ -521,6 +571,15 @@ class Database:
             conn.commit()
 
     def replace_file_symbols(self, file_path: str, symbols: Sequence[SymbolRecord]) -> None:
+        deduped_symbols: list[SymbolRecord] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for symbol in symbols:
+            key = (str(symbol.qualified_name), str(symbol.file_path))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_symbols.append(symbol)
+
         with closing(self.connect()) as conn:
             old_symbol_rows = conn.execute(
                 "SELECT id FROM symbols WHERE file_path = ?;",
@@ -537,7 +596,7 @@ class Database:
                 (file_path,),
             )
             conn.execute("DELETE FROM symbols WHERE file_path = ?;", (file_path,))
-            for symbol in symbols:
+            for symbol in deduped_symbols:
                 cursor = conn.execute(
                     """
                     INSERT INTO symbols (
@@ -910,6 +969,157 @@ class Database:
             """,
             (tool_name, max(1, limit)),
         )
+
+    def record_indexing_diagnostic(
+        self,
+        run_id: str,
+        stage: str,
+        category: str,
+        message: str,
+        hint: str | None = None,
+        file_path: str | None = None,
+        language: str | None = None,
+        severity: str = "error",
+    ) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO indexing_diagnostics(
+                    run_id, stage, category, severity, file_path, language, message, hint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    run_id,
+                    stage,
+                    category,
+                    severity,
+                    file_path,
+                    language,
+                    message,
+                    hint,
+                ),
+            )
+            conn.commit()
+
+    def list_indexing_diagnostics(
+        self,
+        limit: int = 100,
+        run_id: str | None = None,
+        stage: str | None = None,
+        severity: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if run_id:
+            where_clauses.append("run_id = ?")
+            params.append(run_id)
+        if stage:
+            where_clauses.append("stage = ?")
+            params.append(stage)
+        if severity:
+            where_clauses.append("severity = ?")
+            params.append(severity)
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+        query = f"""
+            SELECT
+                id,
+                run_id,
+                stage,
+                category,
+                severity,
+                file_path,
+                language,
+                message,
+                hint,
+                created_at
+            FROM indexing_diagnostics
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ?;
+        """
+        params.append(max(1, limit))
+        return self.query(query, tuple(params))
+
+    def summarize_indexing_diagnostics(self, run_id: str | None = None) -> dict[str, Any]:
+        where_sql = ""
+        params: tuple[Any, ...] = ()
+        if run_id:
+            where_sql = "WHERE run_id = ?"
+            params = (run_id,)
+
+        total_rows = self.query(
+            f"SELECT COUNT(*) AS count FROM indexing_diagnostics {where_sql};",
+            params,
+        )
+        total = int(total_rows[0]["count"]) if total_rows else 0
+
+        by_stage_rows = self.query(
+            f"""
+            SELECT stage, COUNT(*) AS count
+            FROM indexing_diagnostics
+            {where_sql}
+            GROUP BY stage
+            ORDER BY stage ASC;
+            """,
+            params,
+        )
+        by_category_rows = self.query(
+            f"""
+            SELECT category, COUNT(*) AS count
+            FROM indexing_diagnostics
+            {where_sql}
+            GROUP BY category
+            ORDER BY category ASC;
+            """,
+            params,
+        )
+        by_severity_rows = self.query(
+            f"""
+            SELECT severity, COUNT(*) AS count
+            FROM indexing_diagnostics
+            {where_sql}
+            GROUP BY severity
+            ORDER BY severity ASC;
+            """,
+            params,
+        )
+        latest_rows = self.query(
+            f"""
+            SELECT run_id
+            FROM indexing_diagnostics
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT 1;
+            """,
+            params,
+        )
+        by_stage = {str(row["stage"]): int(row["count"]) for row in by_stage_rows}
+        by_category = {str(row["category"]): int(row["count"]) for row in by_category_rows}
+        by_severity = {str(row["severity"]): int(row["count"]) for row in by_severity_rows}
+        latest_run_id = str(latest_rows[0]["run_id"]) if latest_rows else None
+        return {
+            "total": total,
+            "run_id": run_id,
+            "latest_run_id": latest_run_id,
+            "by_stage": by_stage,
+            "by_category": by_category,
+            "by_severity": by_severity,
+        }
+
+    def clear_indexing_diagnostics(self, run_id: str | None = None) -> int:
+        with closing(self.connect()) as conn:
+            if run_id:
+                cursor = conn.execute(
+                    "DELETE FROM indexing_diagnostics WHERE run_id = ?;",
+                    (run_id,),
+                )
+            else:
+                cursor = conn.execute("DELETE FROM indexing_diagnostics;")
+            deleted = int(cursor.rowcount or 0)
+            conn.commit()
+            return deleted
 
     def set_trusted_signing_key(
         self,

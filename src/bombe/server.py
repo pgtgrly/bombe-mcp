@@ -6,17 +6,20 @@ import argparse
 import inspect
 import json
 import logging
+import os
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+from bombe.config import build_settings
+from bombe.indexer.parser import tree_sitter_capability_report
 from bombe.indexer.pipeline import full_index, incremental_index
 from bombe.indexer.semantic import backend_statuses
 from bombe.models import FileChange
 from bombe.sync.orchestrator import run_sync_cycle
 from bombe.sync.transport import FileControlPlaneTransport
 from bombe.watcher.git_diff import get_changed_files
-from bombe.config import build_settings
 from bombe.store.database import Database, SCHEMA_VERSION
 from bombe.tools.definitions import build_tool_registry, register_tools
 
@@ -66,8 +69,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=500,
         help="Per-request timeout for sync operations in milliseconds.",
     )
+    parser.add_argument(
+        "--runtime-profile",
+        choices=["default", "strict"],
+        default="default",
+        help="Runtime policy profile. strict enforces hard-fail behavior for required parser backends.",
+    )
+    parser.add_argument(
+        "--diagnostics-limit",
+        type=int,
+        default=50,
+        help="Maximum diagnostics rows returned by status/doctor/diagnostics outputs.",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="Optional glob include filter. Repeat for multiple patterns.",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Optional glob exclude filter. Repeat for multiple patterns.",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("preflight", help="Run startup compatibility checks and exit.")
 
     serve_parser = subparsers.add_parser("serve", help="Start MCP server runtime.")
     serve_parser.add_argument(
@@ -115,8 +143,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=250,
         help="Debounce window for filesystem event batching.",
     )
+    watch_parser.add_argument(
+        "--max-change-batch",
+        type=int,
+        default=500,
+        help="Maximum number of changed files processed per watch cycle.",
+    )
 
     subparsers.add_parser("status", help="Print local index status and exit.")
+    diagnostics_parser = subparsers.add_parser(
+        "diagnostics",
+        help="Print parse/index diagnostics and exit.",
+    )
+    diagnostics_parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional diagnostics run id filter.",
+    )
+    diagnostics_parser.add_argument(
+        "--stage",
+        type=str,
+        default=None,
+        help="Optional diagnostics stage filter.",
+    )
+    diagnostics_parser.add_argument(
+        "--severity",
+        type=str,
+        default=None,
+        help="Optional diagnostics severity filter.",
+    )
     doctor_parser = subparsers.add_parser("doctor", help="Run runtime and environment health checks.")
     doctor_parser.add_argument(
         "--fix",
@@ -148,11 +204,66 @@ def _stats_to_payload(stats: Any, mode: str, changed_files: list[FileChange] | N
             {"status": change.status, "path": change.path, "old_path": change.old_path}
             for change in changed_files
         ]
+    run_id = getattr(stats, "run_id", None)
+    if run_id:
+        payload["run_id"] = str(run_id)
+    diagnostics_summary = getattr(stats, "diagnostics_summary", None)
+    if isinstance(diagnostics_summary, dict):
+        payload["diagnostics"] = diagnostics_summary
     return payload
 
 
-def _run_full_index(repo_root: Path, db: Database, workers: int) -> dict[str, Any]:
-    stats = full_index(repo_root, db, workers=max(1, workers))
+def _pattern_list(raw_patterns: Any) -> list[str]:
+    if not isinstance(raw_patterns, list):
+        return []
+    normalized: list[str] = []
+    for pattern in raw_patterns:
+        text = str(pattern).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _matches_change_pattern(path: str, pattern: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return fnmatch(normalized, pattern) or fnmatch(Path(normalized).name, pattern)
+
+
+def _filter_changes(
+    changes: list[FileChange],
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+) -> list[FileChange]:
+    filtered: list[FileChange] = []
+    for change in changes:
+        path = change.path
+        if include_patterns and not any(
+            _matches_change_pattern(path, pattern) for pattern in include_patterns
+        ):
+            continue
+        if exclude_patterns and any(
+            _matches_change_pattern(path, pattern) for pattern in exclude_patterns
+        ):
+            continue
+        filtered.append(change)
+    return filtered
+
+
+def _run_full_index(
+    repo_root: Path,
+    db: Database,
+    workers: int,
+    args: argparse.Namespace | None = None,
+) -> dict[str, Any]:
+    include_patterns = _pattern_list(getattr(args, "include", [])) if args is not None else []
+    exclude_patterns = _pattern_list(getattr(args, "exclude", [])) if args is not None else []
+    stats = full_index(
+        repo_root,
+        db,
+        workers=max(1, workers),
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+    )
     payload = _stats_to_payload(stats, mode="full")
     logging.getLogger(__name__).info(
         "Full index complete: files_indexed=%d symbols=%d edges=%d elapsed_ms=%d",
@@ -169,9 +280,30 @@ def _run_incremental_index(
     db: Database,
     workers: int,
     changes: list[FileChange] | None = None,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     del workers
-    resolved_changes = changes if changes is not None else get_changed_files(repo_root)
+    include_patterns = _pattern_list(getattr(args, "include", [])) if args is not None else []
+    exclude_patterns = _pattern_list(getattr(args, "exclude", [])) if args is not None else []
+    if changes is None:
+        resolved_changes = get_changed_files(
+            repo_root,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+    else:
+        resolved_changes = _filter_changes(changes, include_patterns, exclude_patterns)
+    if resolved_changes:
+        logging.getLogger(__name__).info(
+            "Detected file changes before incremental index: %s",
+            json.dumps(
+                [
+                    {"status": change.status, "path": change.path, "old_path": change.old_path}
+                    for change in resolved_changes
+                ],
+                sort_keys=True,
+            ),
+        )
     stats = incremental_index(repo_root, db, resolved_changes)
     payload = _stats_to_payload(stats, mode="incremental", changed_files=resolved_changes)
     logging.getLogger(__name__).info(
@@ -230,7 +362,7 @@ def _run_hybrid_sync(
     return payload
 
 
-def _status_payload(db: Database, repo_root: Path) -> dict[str, Any]:
+def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) -> dict[str, Any]:
     schema_row = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
     schema_version = int(schema_row[0]["value"]) if schema_row else 0
     file_rows = db.query("SELECT COUNT(*) AS count FROM files;")
@@ -257,6 +389,10 @@ def _status_payload(db: Database, repo_root: Path) -> dict[str, Any]:
         }
         for row in latest_files
     ]
+    diagnostics_limit = max(1, diagnostics_limit)
+    diagnostics_summary = db.summarize_indexing_diagnostics()
+    recent_diagnostics = db.list_indexing_diagnostics(limit=diagnostics_limit)
+    error_count = int(diagnostics_summary.get("by_severity", {}).get("error", 0))
     return {
         "repo_root": repo_root.as_posix(),
         "db_path": db.db_path.as_posix(),
@@ -268,8 +404,12 @@ def _status_payload(db: Database, repo_root: Path) -> dict[str, Any]:
             "sync_queue_pending": int(queued_rows[0]["count"]) if queued_rows else 0,
             "artifact_pins": int(pin_rows[0]["count"]) if pin_rows else 0,
             "artifact_quarantine": int(quarantine_rows[0]["count"]) if quarantine_rows else 0,
+            "indexing_diagnostics_total": int(diagnostics_summary.get("total", 0)),
+            "indexing_diagnostics_errors": error_count,
         },
         "latest_indexed_files": latest,
+        "indexing_diagnostics_summary": diagnostics_summary,
+        "recent_indexing_diagnostics": recent_diagnostics,
         "latest_pins": db.query(
             """
             SELECT repo_id, snapshot_id, artifact_id, pinned_at
@@ -289,7 +429,10 @@ def _status_payload(db: Database, repo_root: Path) -> dict[str, Any]:
 
 
 def _is_path_writable(directory: Path) -> bool:
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return False
     probe = directory / ".bombe-write-check"
     try:
         probe.write_text("ok", encoding="utf-8")
@@ -299,9 +442,113 @@ def _is_path_writable(directory: Path) -> bool:
         return False
 
 
+def _apply_runtime_profile(runtime_profile: str) -> None:
+    if runtime_profile == "strict":
+        os.environ["BOMBE_REQUIRE_TREE_SITTER"] = "1"
+        return
+    os.environ.pop("BOMBE_REQUIRE_TREE_SITTER", None)
+
+
+def _preflight_payload(repo_root: Path, db_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    runtime_profile = str(getattr(args, "runtime_profile", "default"))
+    checks: list[dict[str, Any]] = []
+    error_codes: list[str] = []
+
+    db_writable = _is_path_writable(db_path.parent)
+    checks.append(
+        {
+            "code": "db_directory_unwritable",
+            "name": "db_directory_writable",
+            "status": "ok" if db_writable else "error",
+            "detail": {"path": db_path.parent.as_posix()},
+        }
+    )
+    if not db_writable:
+        error_codes.append("db_directory_unwritable")
+
+    control_plane_root = getattr(args, "control_plane_root", None)
+    if control_plane_root is None:
+        control_plane_root = repo_root / ".bombe" / "control-plane"
+    control_plane_writable = _is_path_writable(Path(control_plane_root))
+    checks.append(
+        {
+            "code": "control_plane_unwritable",
+            "name": "control_plane_writable",
+            "status": "ok" if control_plane_writable else "degraded",
+            "detail": {"path": Path(control_plane_root).as_posix()},
+        }
+    )
+
+    try:
+        from mcp.server.fastmcp import FastMCP  # type: ignore
+    except Exception:
+        checks.append(
+            {
+                "code": "mcp_runtime_unavailable",
+                "name": "mcp_runtime",
+                "status": "degraded",
+                "detail": {"available": False},
+            }
+        )
+    else:
+        _ = FastMCP
+        checks.append(
+            {
+                "code": "mcp_runtime_unavailable",
+                "name": "mcp_runtime",
+                "status": "ok",
+                "detail": {"available": True},
+            }
+        )
+
+    capability = tree_sitter_capability_report()
+    missing_languages = [
+        str(item["language"])
+        for item in capability.get("languages", [])
+        if not bool(item.get("available"))
+    ]
+    strict_ready = not (runtime_profile == "strict" and missing_languages)
+    if runtime_profile == "strict":
+        status = "ok" if strict_ready and capability.get("all_required_available", False) else "error"
+    else:
+        status = "ok" if capability.get("all_required_available", False) else "degraded"
+    checks.append(
+        {
+            "code": "tree_sitter_required_language_missing",
+            "name": "tree_sitter_capabilities",
+            "status": status,
+            "detail": {
+                "runtime_profile": runtime_profile,
+                "all_required_available": bool(capability.get("all_required_available", False)),
+                "missing_required_languages": missing_languages,
+                "required_languages": capability.get("required_languages", []),
+                "versions": capability.get("versions", {}),
+            },
+        }
+    )
+    if status == "error":
+        error_codes.append("tree_sitter_required_language_missing")
+
+    overall_status = "ok"
+    if any(check["status"] == "error" for check in checks):
+        overall_status = "error"
+    elif any(check["status"] == "degraded" for check in checks):
+        overall_status = "degraded"
+
+    return {
+        "status": overall_status,
+        "runtime_profile": runtime_profile,
+        "repo_root": repo_root.as_posix(),
+        "db_path": db_path.as_posix(),
+        "checks": checks,
+        "error_codes": error_codes,
+    }
+
+
 def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     fixes_applied: list[dict[str, Any]] = []
+    runtime_profile = str(getattr(args, "runtime_profile", "default"))
     if bool(getattr(args, "fix", False)):
         db.init_schema()
         normalized_rows = db.normalize_sync_queue_statuses()
@@ -377,7 +624,7 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
     checks.append(
         {
             "name": "tool_registry",
-            "status": "ok" if len(tool_registry) >= 7 else "degraded",
+            "status": "ok" if len(tool_registry) >= 11 else "degraded",
             "detail": {"tool_count": len(tool_registry)},
         }
     )
@@ -409,6 +656,41 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
         }
     )
 
+    tree_sitter_capabilities = tree_sitter_capability_report()
+    missing_required_languages = [
+        str(item["language"])
+        for item in tree_sitter_capabilities.get("languages", [])
+        if not bool(item.get("available"))
+    ]
+    profile_ready = not (runtime_profile == "strict" and missing_required_languages)
+    checks.append(
+        {
+            "name": "runtime_profile_readiness",
+            "status": "ok" if profile_ready else "degraded",
+            "detail": {
+                "runtime_profile": runtime_profile,
+                "missing_required_languages": missing_required_languages,
+                "required_languages": tree_sitter_capabilities.get("required_languages", []),
+                "versions": tree_sitter_capabilities.get("versions", {}),
+            },
+        }
+    )
+
+    diagnostics_limit = max(1, int(getattr(args, "diagnostics_limit", 50)))
+    diagnostics_summary = db.summarize_indexing_diagnostics()
+    diagnostics_errors = int(diagnostics_summary.get("by_severity", {}).get("error", 0))
+    checks.append(
+        {
+            "name": "indexing_diagnostics",
+            "status": "ok" if diagnostics_errors == 0 else "degraded",
+            "detail": {
+                "total": int(diagnostics_summary.get("total", 0)),
+                "errors": diagnostics_errors,
+                "latest_run_id": diagnostics_summary.get("latest_run_id"),
+            },
+        }
+    )
+
     overall_status = "ok"
     if any(check["status"] != "ok" for check in checks):
         overall_status = "degraded"
@@ -421,10 +703,13 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
         ]
     return {
         "status": overall_status,
+        "runtime_profile": runtime_profile,
         "repo_root": repo_root.as_posix(),
         "db_path": db.db_path.as_posix(),
         "fixes_applied": fixes_applied,
         "checks": checks,
+        "indexing_diagnostics_summary": diagnostics_summary,
+        "recent_indexing_diagnostics": db.list_indexing_diagnostics(limit=diagnostics_limit),
         "recommendations": recommendations,
     }
 
@@ -443,17 +728,22 @@ def _collect_fs_changes(
     repo_root: Path,
     interval_ms: int,
     debounce_ms: int,
-) -> list[FileChange]:
+    max_events: int,
+) -> tuple[list[FileChange], bool]:
     try:
         from watchdog.events import FileSystemEventHandler  # type: ignore
         from watchdog.observers import Observer  # type: ignore
     except Exception:
-        return []
+        return [], False
 
     changed_paths: set[str] = set()
+    overflow = False
 
     class _Collector(FileSystemEventHandler):  # type: ignore[misc]
         def on_any_event(self, event) -> None:  # type: ignore[no-untyped-def]
+            nonlocal overflow
+            if overflow:
+                return
             if getattr(event, "is_directory", False):
                 return
             src_path = str(getattr(event, "src_path", "") or "")
@@ -464,12 +754,17 @@ def _collect_fs_changes(
             except Exception:
                 return
             changed_paths.add(rel)
+            if len(changed_paths) >= max_events:
+                overflow = True
+                return
 
             dest_path = str(getattr(event, "dest_path", "") or "")
             if dest_path:
                 try:
                     rel_dest = Path(dest_path).resolve().relative_to(repo_root.resolve()).as_posix()
                     changed_paths.add(rel_dest)
+                    if len(changed_paths) >= max_events:
+                        overflow = True
                 except Exception:
                     return
 
@@ -490,7 +785,7 @@ def _collect_fs_changes(
         absolute = repo_root / rel
         status = "M" if absolute.exists() else "D"
         changes.append(FileChange(status=status, path=rel))
-    return changes
+    return changes, overflow
 
 
 def _run_watch(
@@ -502,12 +797,19 @@ def _run_watch(
     max_cycles = max(0, int(getattr(args, "max_cycles", 0)))
     debounce_ms = max(0, int(getattr(args, "debounce_ms", 250)))
     workers = int(getattr(args, "workers", 4))
+    max_change_batch = max(1, int(getattr(args, "max_change_batch", 500)))
     requested_mode = str(getattr(args, "watch_mode", "auto"))
+    include_patterns = _pattern_list(getattr(args, "include", []))
+    exclude_patterns = _pattern_list(getattr(args, "exclude", []))
     fs_available = _filesystem_events_available()
     if requested_mode == "poll":
         effective_mode = "poll"
     elif requested_mode == "fs":
-        effective_mode = "fs" if fs_available else "poll"
+        if not fs_available:
+            raise RuntimeError(
+                "Filesystem watch mode requested but watchdog filesystem events are unavailable."
+            )
+        effective_mode = "fs"
     else:
         effective_mode = "fs" if fs_available else "poll"
 
@@ -515,19 +817,38 @@ def _run_watch(
     runs = 0
     changed_files_total = 0
     files_indexed_total = 0
+    truncated_cycles = 0
+    overflow_cycles = 0
     last_index_payload: dict[str, Any] | None = None
     last_sync_payload: dict[str, Any] | None = None
 
     while True:
         cycles += 1
         if effective_mode == "fs":
-            changes = _collect_fs_changes(
+            changes, overflow = _collect_fs_changes(
                 repo_root=repo_root,
                 interval_ms=poll_interval_ms,
                 debounce_ms=debounce_ms,
+                max_events=max_change_batch * 4,
             )
+            if overflow:
+                overflow_cycles += 1
         else:
-            changes = get_changed_files(repo_root)
+            changes = get_changed_files(
+                repo_root,
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+            )
+            overflow = False
+        changes = _filter_changes(changes, include_patterns, exclude_patterns)
+        if len(changes) > max_change_batch:
+            truncated_cycles += 1
+            dropped = len(changes) - max_change_batch
+            logging.getLogger(__name__).warning(
+                "Watch change burst exceeded batch limit; truncating %d files for this cycle.",
+                dropped,
+            )
+            changes = changes[:max_change_batch]
         changed_files_total += len(changes)
         if changes:
             last_index_payload = _run_incremental_index(
@@ -535,6 +856,7 @@ def _run_watch(
                 db=db,
                 workers=workers,
                 changes=changes,
+                args=args,
             )
             runs += 1
             files_indexed_total += int(last_index_payload.get("files_indexed", 0))
@@ -564,6 +886,11 @@ def _run_watch(
         "index_runs": runs,
         "changed_files_seen": changed_files_total,
         "files_indexed": files_indexed_total,
+        "include_patterns": include_patterns,
+        "exclude_patterns": exclude_patterns,
+        "max_change_batch": max_change_batch,
+        "truncated_cycles": truncated_cycles,
+        "overflow_cycles": overflow_cycles,
         "poll_interval_ms": poll_interval_ms,
         "debounce_ms": debounce_ms,
         "last_index": last_index_payload,
@@ -579,8 +906,19 @@ def main() -> None:
         db_path=args.db_path,
         log_level=args.log_level,
         init_only=args.init_only,
+        runtime_profile=str(getattr(args, "runtime_profile", "default")),
     )
     configure_logging(settings.log_level)
+    _apply_runtime_profile(settings.runtime_profile)
+
+    command = str(getattr(args, "command", "serve") or "serve")
+    if command == "preflight":
+        payload = _preflight_payload(settings.repo_root, settings.db_path, args)
+        print(json.dumps(payload, sort_keys=True))
+        if payload["status"] == "error":
+            raise SystemExit(1)
+        return
+
     db = Database(settings.db_path)
     db.init_schema()
 
@@ -591,12 +929,16 @@ def main() -> None:
         settings.init_only,
     )
 
-    command = str(getattr(args, "command", "serve") or "serve")
     if settings.init_only:
         return
 
     if command == "index-full":
-        payload = _run_full_index(settings.repo_root, db, int(getattr(args, "workers", 4)))
+        payload = _run_full_index(
+            settings.repo_root,
+            db,
+            int(getattr(args, "workers", 4)),
+            args=args,
+        )
         sync_payload = _run_hybrid_sync(settings.repo_root, db, args, changes=_all_file_changes(db))
         if sync_payload is not None:
             payload["sync"] = sync_payload
@@ -610,6 +952,7 @@ def main() -> None:
             db,
             int(getattr(args, "workers", 4)),
             changes=changes,
+            args=args,
         )
         sync_payload = _run_hybrid_sync(settings.repo_root, db, args, changes=changes)
         if sync_payload is not None:
@@ -618,7 +961,39 @@ def main() -> None:
         return
 
     if command == "status":
-        payload = _status_payload(db, settings.repo_root)
+        payload = _status_payload(
+            db,
+            settings.repo_root,
+            diagnostics_limit=max(1, int(getattr(args, "diagnostics_limit", 50))),
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "diagnostics":
+        diagnostics_limit = max(1, int(getattr(args, "diagnostics_limit", 50)))
+        run_id_raw = getattr(args, "run_id", None)
+        stage_raw = getattr(args, "stage", None)
+        severity_raw = getattr(args, "severity", None)
+        run_id = str(run_id_raw) if run_id_raw else None
+        stage = str(stage_raw) if stage_raw else None
+        severity = str(severity_raw) if severity_raw else None
+        diagnostics = db.list_indexing_diagnostics(
+            limit=diagnostics_limit,
+            run_id=run_id,
+            stage=stage,
+            severity=severity,
+        )
+        payload = {
+            "filters": {
+                "run_id": run_id,
+                "stage": stage,
+                "severity": severity,
+                "limit": diagnostics_limit,
+            },
+            "diagnostics": diagnostics,
+            "count": len(diagnostics),
+            "summary": db.summarize_indexing_diagnostics(run_id=run_id),
+        }
         print(json.dumps(payload, sort_keys=True))
         return
 
@@ -633,11 +1008,15 @@ def main() -> None:
         return
 
     if str(getattr(args, "index_mode", "none")) == "full":
-        _run_full_index(settings.repo_root, db, workers=4)
+        _run_full_index(settings.repo_root, db, workers=4, args=args)
         _run_hybrid_sync(settings.repo_root, db, args, changes=_all_file_changes(db))
     elif str(getattr(args, "index_mode", "none")) == "incremental":
-        serve_changes = get_changed_files(settings.repo_root)
-        _run_incremental_index(settings.repo_root, db, workers=4, changes=serve_changes)
+        serve_changes = get_changed_files(
+            settings.repo_root,
+            include_patterns=_pattern_list(getattr(args, "include", [])),
+            exclude_patterns=_pattern_list(getattr(args, "exclude", [])),
+        )
+        _run_incremental_index(settings.repo_root, db, workers=4, changes=serve_changes, args=args)
         _run_hybrid_sync(settings.repo_root, db, args, changes=serve_changes)
 
     class LocalServer:

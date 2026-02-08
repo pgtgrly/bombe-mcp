@@ -26,12 +26,18 @@ LANGUAGE_BY_EXTENSION = {
 
 
 def load_gitignore_rules(repo_root: Path) -> list[IgnoreRule]:
-    gitignore_path = repo_root / ".gitignore"
-    if not gitignore_path.exists():
-        return []
+    return _load_ignore_file(repo_root / ".gitignore")
 
+
+def load_bombeignore_rules(repo_root: Path) -> list[IgnoreRule]:
+    return _load_ignore_file(repo_root / ".bombeignore")
+
+
+def _load_ignore_file(ignore_path: Path) -> list[IgnoreRule]:
+    if not ignore_path.exists():
+        return []
     rules: list[IgnoreRule] = []
-    for line in gitignore_path.read_text(encoding="utf-8").splitlines():
+    for line in ignore_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -43,22 +49,53 @@ def load_gitignore_rules(repo_root: Path) -> list[IgnoreRule]:
     return rules
 
 
+def _normalize_pattern(pattern: str) -> IgnoreRule:
+    stripped = pattern.strip()
+    directory_only = stripped.endswith("/")
+    normalized = stripped[:-1] if directory_only else stripped
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return IgnoreRule(pattern=normalized, directory_only=directory_only)
+
+
+def _matches_pattern(rel_path: str, pattern: str) -> bool:
+    normalized = rel_path.replace("\\", "/")
+    return fnmatch(normalized, pattern) or fnmatch(Path(normalized).name, pattern)
+
+
 def is_ignored(rel_path: str, is_dir: bool, rules: list[IgnoreRule]) -> bool:
     normalized = rel_path.replace("\\", "/")
     for rule in rules:
         if rule.directory_only and not is_dir:
             continue
-        if fnmatch(normalized, rule.pattern):
-            return True
-        if fnmatch(Path(normalized).name, rule.pattern):
+        if _matches_pattern(normalized, rule.pattern):
             return True
         if normalized.startswith(f"{rule.pattern}/"):
             return True
     return False
 
 
-def iter_repo_files(repo_root: Path) -> Iterator[Path]:
-    rules = load_gitignore_rules(repo_root)
+def _matches_any_include(rel_path: str, include_patterns: list[str]) -> bool:
+    if not include_patterns:
+        return True
+    for pattern in include_patterns:
+        if _matches_pattern(rel_path, pattern):
+            return True
+    return False
+
+
+def iter_repo_files(
+    repo_root: Path,
+    include_patterns: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+) -> Iterator[Path]:
+    rules = [*load_gitignore_rules(repo_root), *load_bombeignore_rules(repo_root)]
+    include = [pattern for pattern in (include_patterns or []) if pattern.strip()]
+    for pattern in (exclude_patterns or []):
+        stripped = pattern.strip()
+        if not stripped:
+            continue
+        rules.append(_normalize_pattern(stripped))
     implicit_ignored_dirs = {".git", ".bombe"}
     for root, dirs, files in os.walk(repo_root):
         root_path = Path(root)
@@ -82,6 +119,8 @@ def iter_repo_files(repo_root: Path) -> Iterator[Path]:
             full_path = root_path / file_name
             rel_file = full_path.relative_to(repo_root).as_posix()
             if is_ignored(rel_file, is_dir=False, rules=rules):
+                continue
+            if not _matches_any_include(rel_file, include):
                 continue
             yield full_path
 

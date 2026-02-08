@@ -26,19 +26,31 @@ PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --init-only --log-level INFO
 ```
 
-3. Start local server:
+3. Run preflight checks (strict profile recommended for benchmark/demo quality):
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --runtime-profile strict preflight
+```
+
+4. Start local server:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path --log-level INFO
 ```
 
-4. Run health diagnostics:
+5. Run health diagnostics:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path doctor
 ```
 
-5. Apply safe automatic repairs when diagnostics show degraded state:
+6. Inspect parse/index diagnostics:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path diagnostics --severity error --diagnostics-limit 100
+```
+
+7. Apply safe automatic repairs when diagnostics show degraded state:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /absolute/repo/path doctor --fix

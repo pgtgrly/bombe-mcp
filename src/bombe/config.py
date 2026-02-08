@@ -12,6 +12,7 @@ class Settings:
     db_path: Path
     log_level: str
     init_only: bool
+    runtime_profile: str
 
 
 def resolve_repo_path(repo: Path) -> Path:
@@ -34,6 +35,7 @@ def build_settings(
     db_path: Path | None,
     log_level: str,
     init_only: bool,
+    runtime_profile: str,
 ) -> Settings:
     repo_root = resolve_repo_path(repo)
     resolved_db_path = resolve_db_path(repo_root, db_path)
@@ -42,4 +44,5 @@ def build_settings(
         db_path=resolved_db_path,
         log_level=log_level,
         init_only=init_only,
+        runtime_profile=runtime_profile,
     )

@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from bombe.models import ArtifactBundle, EdgeContractRecord, IndexDelta, SymbolKey
-from bombe.sync.client import build_artifact_signature
+from bombe.sync.client import build_artifact_checksum, build_artifact_signature
 from bombe.sync.reconcile import promote_delta
 
 
@@ -140,6 +140,10 @@ class FileControlPlaneTransport:
                     artifact,
                     signature_algo=self.signing_algorithm,
                     signing_key_id=self.signing_key_id,
+                )
+                artifact = replace(
+                    artifact,
+                    checksum=build_artifact_checksum(artifact),
                 )
                 artifact = replace(
                     artifact,

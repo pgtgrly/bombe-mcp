@@ -20,11 +20,13 @@ class ConfigTests(unittest.TestCase):
                 db_path=None,
                 log_level="INFO",
                 init_only=False,
+                runtime_profile="default",
             )
             self.assertEqual(settings.repo_root, repo.resolve())
             self.assertEqual(settings.db_path, repo.resolve() / ".bombe" / "bombe.db")
             self.assertEqual(settings.log_level, "INFO")
             self.assertFalse(settings.init_only)
+            self.assertEqual(settings.runtime_profile, "default")
 
 
 if __name__ == "__main__":

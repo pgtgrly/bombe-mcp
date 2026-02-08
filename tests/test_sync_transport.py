@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from bombe.models import DeltaHeader, IndexDelta, SymbolRecord
-from bombe.sync.client import validate_artifact_signature
+from bombe.sync.client import validate_artifact_checksum, validate_artifact_signature
 from bombe.sync.transport import FileControlPlaneTransport
 
 
@@ -42,6 +42,7 @@ class SyncTransportTests(unittest.TestCase):
             self.assertIsNotNone(artifact.signature)
             self.assertEqual(artifact.signature_algo, "hmac-sha256")
             self.assertEqual(artifact.signing_key_id, "local")
+            self.assertTrue(validate_artifact_checksum(artifact))
             self.assertTrue(validate_artifact_signature(artifact, "secret"))
 
 

@@ -76,6 +76,10 @@ class MCPContractTests(unittest.TestCase):
                 "get_blast_radius",
                 "trace_data_flow",
                 "change_impact",
+                "get_indexing_diagnostics",
+                "get_server_status",
+                "estimate_context_size",
+                "get_context_summary",
             })
             self.assertIsNotNone(fake_server.registered["search_symbols"]["input_schema"])
 
@@ -185,6 +189,81 @@ class MCPContractTests(unittest.TestCase):
                 },
             )
 
+            diagnostics_payload = registry["get_indexing_diagnostics"]["handler"](
+                {"limit": 10, "include_summary": True}
+            )
+            self.assertEqual(
+                set(diagnostics_payload.keys()),
+                {"diagnostics", "count", "filters", "summary"},
+            )
+            self.assertEqual(int(diagnostics_payload["count"]), 0)
+            self.assertEqual(set(diagnostics_payload["summary"].keys()), {
+                "total",
+                "run_id",
+                "latest_run_id",
+                "by_stage",
+                "by_category",
+                "by_severity",
+            })
+
+            status_payload = registry["get_server_status"]["handler"](
+                {"diagnostics_limit": 10, "metrics_limit": 10}
+            )
+            self.assertEqual(
+                set(status_payload.keys()),
+                {
+                    "repo_root",
+                    "db_path",
+                    "counts",
+                    "indexing_diagnostics_summary",
+                    "recent_indexing_diagnostics",
+                    "recent_tool_metrics",
+                },
+            )
+            self.assertEqual(
+                set(status_payload["counts"].keys()),
+                {
+                    "files",
+                    "symbols",
+                    "edges",
+                    "sync_queue_pending",
+                    "indexing_diagnostics_total",
+                    "indexing_diagnostics_errors",
+                },
+            )
+
+            estimate_payload = registry["estimate_context_size"]["handler"](
+                {"query": "authenticate flow", "token_budget": 100}
+            )
+            self.assertEqual(
+                set(estimate_payload.keys()),
+                {
+                    "query",
+                    "estimated_tokens",
+                    "token_budget",
+                    "fits_budget",
+                    "symbols_estimated",
+                    "estimation_mode",
+                },
+            )
+
+            summary_payload = registry["get_context_summary"]["handler"](
+                {"query": "authenticate flow", "token_budget": 100}
+            )
+            self.assertEqual(
+                set(summary_payload.keys()),
+                {
+                    "query",
+                    "summary",
+                    "selection_strategy",
+                    "relationship_map",
+                    "module_summaries",
+                    "tokens_used",
+                    "token_budget",
+                    "symbols_included",
+                },
+            )
+
             metric_rows = db.query(
                 """
                 SELECT tool_name, success
@@ -192,7 +271,7 @@ class MCPContractTests(unittest.TestCase):
                 ORDER BY id;
                 """
             )
-            self.assertGreaterEqual(len(metric_rows), 7)
+            self.assertGreaterEqual(len(metric_rows), 11)
             self.assertTrue(all(int(row["success"]) == 1 for row in metric_rows))
 
 

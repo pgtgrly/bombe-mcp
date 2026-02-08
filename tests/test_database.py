@@ -29,7 +29,7 @@ class DatabaseTests(unittest.TestCase):
             version = db.query(
                 "SELECT value FROM repo_meta WHERE key = 'schema_version';"
             )
-            self.assertEqual(version[0]["value"], "5")
+            self.assertEqual(version[0]["value"], "6")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,6 +67,54 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(rows[0]["name"], "name")
             self.assertEqual(rows[0]["type"], "str")
             self.assertEqual(rows[0]["position"], 0)
+
+    def test_replace_file_symbols_dedupes_duplicate_qualified_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            db.upsert_files(
+                [
+                    FileRecord(
+                        path="src/dup.java",
+                        language="java",
+                        content_hash="hash-dup",
+                        size_bytes=20,
+                    )
+                ]
+            )
+            db.replace_file_symbols(
+                file_path="src/dup.java",
+                symbols=[
+                    SymbolRecord(
+                        name="run",
+                        qualified_name="pkg.Service.run",
+                        kind="method",
+                        file_path="src/dup.java",
+                        start_line=10,
+                        end_line=11,
+                        signature="void run()",
+                    ),
+                    SymbolRecord(
+                        name="run",
+                        qualified_name="pkg.Service.run",
+                        kind="method",
+                        file_path="src/dup.java",
+                        start_line=20,
+                        end_line=21,
+                        signature="void run(int retries)",
+                    ),
+                ],
+            )
+
+            rows = db.query(
+                """
+                SELECT qualified_name
+                FROM symbols
+                WHERE file_path = 'src/dup.java';
+                """
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0]["qualified_name"]), "pkg.Service.run")
 
     def test_rename_file_updates_related_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,7 +201,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "5")
+            self.assertEqual(version[0]["value"], "6")
             fts_table = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
             )
@@ -180,7 +228,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "5")
+            self.assertEqual(version[0]["value"], "6")
             table_rows = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trusted_signing_keys';"
             )
@@ -196,6 +244,41 @@ class DatabaseTests(unittest.TestCase):
             )
             self.assertEqual(len(migration_rows), 1)
             self.assertEqual(int(migration_rows[0]["from_version"]), 4)
+            self.assertEqual(str(migration_rows[0]["status"]), "success")
+
+    def test_init_schema_migrates_from_v5_to_v6_diagnostics_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO repo_meta(key, value)
+                    VALUES('schema_version', '5')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """
+                )
+                conn.execute("DROP TABLE IF EXISTS indexing_diagnostics;")
+                conn.commit()
+
+            db.init_schema()
+            version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
+            self.assertEqual(version[0]["value"], "6")
+            table_rows = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'indexing_diagnostics';"
+            )
+            self.assertEqual(len(table_rows), 1)
+            migration_rows = db.query(
+                """
+                SELECT from_version, to_version, status
+                FROM migration_history
+                WHERE to_version = 6
+                ORDER BY id DESC
+                LIMIT 1;
+                """
+            )
+            self.assertEqual(len(migration_rows), 1)
+            self.assertEqual(int(migration_rows[0]["from_version"]), 5)
             self.assertEqual(str(migration_rows[0]["status"]), "success")
 
     def test_backup_and_restore_round_trip(self) -> None:
@@ -299,6 +382,74 @@ class DatabaseTests(unittest.TestCase):
                 conn.commit()
             fixed = db.normalize_sync_queue_statuses()
             self.assertGreaterEqual(fixed, 1)
+
+    def test_indexing_diagnostics_persistence_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+
+            db.record_indexing_diagnostic(
+                run_id="run_a",
+                stage="parse",
+                category="syntax_error",
+                message="line 10",
+                hint="Fix invalid syntax and retry indexing.",
+                file_path="src/a.py",
+                language="python",
+                severity="error",
+            )
+            db.record_indexing_diagnostic(
+                run_id="run_a",
+                stage="extract",
+                category="extractor_failure",
+                message="unexpected ast shape",
+                hint="Check extractor support for this construct.",
+                file_path="src/a.py",
+                language="python",
+                severity="warning",
+            )
+            db.record_indexing_diagnostic(
+                run_id="run_b",
+                stage="parse",
+                category="parser_unavailable",
+                message="missing backend",
+                hint="Install compatible tree-sitter parser runtime.",
+                file_path="src/b.go",
+                language="go",
+                severity="error",
+            )
+
+            latest = db.list_indexing_diagnostics(limit=2)
+            self.assertEqual(len(latest), 2)
+            self.assertEqual(str(latest[0]["run_id"]), "run_b")
+
+            parse_only = db.list_indexing_diagnostics(limit=10, run_id="run_a", stage="parse")
+            self.assertEqual(len(parse_only), 1)
+            self.assertEqual(str(parse_only[0]["category"]), "syntax_error")
+
+            error_only = db.list_indexing_diagnostics(limit=10, severity="error")
+            self.assertEqual(len(error_only), 2)
+
+            all_summary = db.summarize_indexing_diagnostics()
+            self.assertEqual(int(all_summary["total"]), 3)
+            self.assertEqual(int(all_summary["by_stage"]["parse"]), 2)
+            self.assertEqual(int(all_summary["by_category"]["syntax_error"]), 1)
+            self.assertEqual(int(all_summary["by_severity"]["error"]), 2)
+            self.assertEqual(str(all_summary["latest_run_id"]), "run_b")
+
+            run_summary = db.summarize_indexing_diagnostics(run_id="run_a")
+            self.assertEqual(int(run_summary["total"]), 2)
+            self.assertEqual(int(run_summary["by_stage"]["extract"]), 1)
+            self.assertEqual(int(run_summary["by_severity"]["warning"]), 1)
+
+            deleted_one = db.clear_indexing_diagnostics(run_id="run_a")
+            self.assertEqual(deleted_one, 2)
+            remaining = db.list_indexing_diagnostics(limit=10)
+            self.assertEqual(len(remaining), 1)
+
+            deleted_rest = db.clear_indexing_diagnostics()
+            self.assertEqual(deleted_rest, 1)
+            self.assertEqual(db.list_indexing_diagnostics(limit=10), [])
 
 
 if __name__ == "__main__":

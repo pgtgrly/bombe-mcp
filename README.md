@@ -42,7 +42,9 @@ The runtime is local-first and works without any control plane. Optional hybrid 
 - Multi-language symbol extraction (Python, TypeScript, Java, Go)
 - Call/import/type dependency edges for structural traversal
 - Strict MCP tool schemas with contract tests
-- Incremental indexing support and perf trend tracking
+- Incremental indexing support (git + non-git fallback) and perf trend tracking
+- Persistent parse/index diagnostics with per-run summaries
+- Include/exclude indexing filters plus `.bombeignore` support
 - Release governance checks for latency and workflow quality gates
 
 ## Requirements
@@ -104,6 +106,10 @@ PYTHONPATH=src python3 -m bombe.server --repo . doctor
 | `--hybrid-sync` | Enable post-index sync cycle | `false` |
 | `--control-plane-root` | File-backed control-plane root | `<repo>/.bombe/control-plane` |
 | `--sync-timeout-ms` | Sync push/pull timeout budget | `500` |
+| `--runtime-profile` | Runtime policy (`default` or strict hard-fail mode) | `default` |
+| `--diagnostics-limit` | Max diagnostics rows for `status`, `doctor`, `diagnostics` | `50` |
+| `--include` | Optional include glob (repeatable) | `[]` |
+| `--exclude` | Optional exclude glob (repeatable) | `[]` |
 
 ### Subcommands
 
@@ -111,10 +117,12 @@ PYTHONPATH=src python3 -m bombe.server --repo . doctor
 |---|---|---|
 | `serve` | Start MCP server runtime | `--index-mode none|full|incremental` |
 | `index-full` | Run full index and exit (JSON stats) | `--workers` |
-| `index-incremental` | Run incremental index from git diff (JSON stats) | `--workers` |
-| `watch` | Loop incremental indexing (JSON summary) | `--max-cycles`, `--poll-interval-ms`, `--watch-mode`, `--debounce-ms` |
+| `index-incremental` | Run incremental index from git status or filesystem snapshot (JSON stats) | `--workers` |
+| `watch` | Loop incremental indexing (JSON summary) | `--max-cycles`, `--poll-interval-ms`, `--watch-mode`, `--debounce-ms`, `--max-change-batch` |
 | `status` | Print index/sync status JSON and exit | - |
+| `diagnostics` | Print parse/index diagnostics JSON and exit | `--run-id`, `--stage`, `--severity` |
 | `doctor` | Run health checks (JSON report) | `--fix` |
+| `preflight` | Run startup compatibility checks (JSON report) | `--runtime-profile` |
 
 ### Command examples
 
@@ -128,6 +136,12 @@ Incremental index:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo index-incremental
+```
+
+Incremental index with filters:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo --include "src/**/*.py" --exclude "*test*" index-incremental
 ```
 
 Hybrid full index + sync:
@@ -154,10 +168,22 @@ Watch mode with filesystem events when available:
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --watch-mode fs --max-cycles 1
 ```
 
+Diagnostics for the latest runs:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo diagnostics --severity error --diagnostics-limit 100
+```
+
 Doctor with safe auto-remediation:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor --fix
+```
+
+Strict-profile preflight (fails fast when required parser backends are unavailable):
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo --runtime-profile strict preflight
 ```
 
 ## Environment Variables
@@ -171,6 +197,7 @@ PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor --fix
 | `BOMBE_SYNC_KEY_ID=...` | Artifact signing key identifier |
 | `BOMBE_REAL_REPO_PATHS=/path/repo1,/path/repo2` | Optional real-repo perf/eval coverage |
 | `BOMBE_SEMANTIC_HINTS_FILE=/abs/semantic-hints.json` | Optional semantic receiver-type hints for call resolution |
+| `BOMBE_REQUIRE_TREE_SITTER=1` | Internal strict parser switch (normally set via `--runtime-profile strict`) |
 
 ## MCP Tools
 
@@ -183,6 +210,10 @@ Available tools:
 - `get_blast_radius`
 - `trace_data_flow`
 - `change_impact`
+- `get_indexing_diagnostics`
+- `get_server_status`
+- `estimate_context_size`
+- `get_context_summary`
 
 ### Input examples
 
@@ -226,6 +257,30 @@ Available tools:
 
 ```json
 {"symbol_name":"app.auth.authenticate","change_type":"signature","max_depth":3}
+```
+
+`get_indexing_diagnostics`
+
+```json
+{"run_id":"<optional_run_id>","stage":"parse","severity":"error","limit":50}
+```
+
+`get_server_status`
+
+```json
+{"diagnostics_limit":20,"metrics_limit":20}
+```
+
+`estimate_context_size`
+
+```json
+{"query":"authenticate flow","entry_points":["app.auth.authenticate"],"token_budget":1200}
+```
+
+`get_context_summary`
+
+```json
+{"query":"authenticate flow","entry_points":["app.auth.authenticate"],"token_budget":1200}
 ```
 
 All dict-returning tools also accept:
@@ -302,7 +357,7 @@ Bombe is split into local runtime modules and optional hybrid modules.
 
 ### Observability and persisted state
 
-SQLite schema version `5` includes state for operations and diagnostics:
+SQLite schema version `6` includes state for operations and diagnostics:
 
 - `sync_queue`
 - `artifact_quarantine`
@@ -310,6 +365,7 @@ SQLite schema version `5` includes state for operations and diagnostics:
 - `circuit_breakers`
 - `sync_events`
 - `tool_metrics`
+- `indexing_diagnostics`
 - `migration_history`
 - `trusted_signing_keys`
 - Repo metadata key `cache_epoch` for query cache invalidation

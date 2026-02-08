@@ -244,6 +244,8 @@ class IndexStats:
     symbols_indexed: int
     edges_indexed: int
     elapsed_ms: int
+    run_id: str | None = None
+    diagnostics_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
