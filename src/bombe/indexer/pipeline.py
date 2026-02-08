@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import zlib
 from pathlib import Path
 
 from bombe.indexer.callgraph import build_call_edges
@@ -12,13 +11,9 @@ from bombe.indexer.imports import resolve_imports
 from bombe.indexer.pagerank import recompute_pagerank
 from bombe.indexer.parser import parse_file
 from bombe.indexer.symbols import extract_symbols
-from bombe.models import EdgeRecord, FileChange, FileRecord, ImportRecord, IndexStats
+from bombe.models import FileChange, FileRecord, ImportRecord, IndexStats
 from bombe.models import ParsedUnit, SymbolRecord
 from bombe.store.database import Database
-
-
-def _symbol_hash(qualified_name: str) -> int:
-    return int(zlib.crc32(qualified_name.encode("utf-8")) & 0x7FFFFFFF)
 
 
 def _scan_repo_files(repo_root: Path) -> tuple[int, list[FileRecord]]:
@@ -52,7 +47,7 @@ def _parse_relative(repo_root: Path, file_record: FileRecord) -> ParsedUnit:
     )
 
 
-def _load_symbols(db: Database) -> tuple[list[SymbolRecord], dict[int, int]]:
+def _load_symbols(db: Database) -> tuple[list[SymbolRecord], dict[tuple[str, str], int]]:
     rows = db.query(
         """
         SELECT id, name, qualified_name, kind, file_path, start_line, end_line,
@@ -80,8 +75,10 @@ def _load_symbols(db: Database) -> tuple[list[SymbolRecord], dict[int, int]]:
         )
         for row in rows
     ]
-    hash_to_id = {_symbol_hash(row["qualified_name"]): int(row["id"]) for row in rows}
-    return symbols, hash_to_id
+    qualified_to_id = {
+        (str(row["qualified_name"]), str(row["file_path"])): int(row["id"]) for row in rows
+    }
+    return symbols, qualified_to_id
 
 
 def _current_files(db: Database) -> list[FileRecord]:
@@ -100,6 +97,9 @@ def _current_files(db: Database) -> list[FileRecord]:
 def _rebuild_dependencies(repo_root: Path, db: Database) -> tuple[int, int]:
     files = _current_files(db)
     files_map = {record.path: record for record in files}
+    file_id_lookup = {
+        record.path: index + 1 for index, record in enumerate(sorted(files, key=lambda item: item.path))
+    }
     parsed_cache: dict[str, ParsedUnit] = {}
     imports_by_file: dict[str, list[ImportRecord]] = {}
     symbols_by_file: dict[str, list[SymbolRecord]] = {}
@@ -118,7 +118,7 @@ def _rebuild_dependencies(repo_root: Path, db: Database) -> tuple[int, int]:
         imports_by_file[file_record.path] = import_records
         db.replace_file_symbols(file_record.path, symbols)
 
-    all_symbols, hash_to_id = _load_symbols(db)
+    all_symbols, qualified_to_id = _load_symbols(db)
     edge_count = 0
     for file_record in files:
         parsed = parsed_cache.get(file_record.path)
@@ -126,7 +126,11 @@ def _rebuild_dependencies(repo_root: Path, db: Database) -> tuple[int, int]:
             continue
         import_records = imports_by_file.get(file_record.path, [])
         import_edges, external = resolve_imports(
-            repo_root.as_posix(), file_record, import_records, files_map
+            repo_root.as_posix(),
+            file_record,
+            import_records,
+            files_map,
+            file_id_lookup=file_id_lookup,
         )
         db.replace_external_deps(file_record.path, external)
 
@@ -134,26 +138,9 @@ def _rebuild_dependencies(repo_root: Path, db: Database) -> tuple[int, int]:
             parsed=parsed,
             file_symbols=symbols_by_file.get(file_record.path, []),
             candidate_symbols=all_symbols,
+            symbol_id_lookup=qualified_to_id,
         )
-        mapped_call_edges = []
-        for edge in call_edges:
-            source_id = hash_to_id.get(edge.source_id)
-            target_id = hash_to_id.get(edge.target_id)
-            if source_id is None or target_id is None:
-                continue
-            mapped_call_edges.append(
-                EdgeRecord(
-                    source_id=source_id,
-                    target_id=target_id,
-                    source_type=edge.source_type,
-                    target_type=edge.target_type,
-                    relationship=edge.relationship,
-                    file_path=edge.file_path,
-                    line_number=edge.line_number,
-                    confidence=edge.confidence,
-                )
-            )
-        combined_edges = [*import_edges, *mapped_call_edges]
+        combined_edges = [*import_edges, *call_edges]
         edge_count += len(combined_edges)
         db.replace_file_edges(file_record.path, combined_edges)
 

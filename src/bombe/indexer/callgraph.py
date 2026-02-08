@@ -14,8 +14,18 @@ CALL_RE = re.compile(
     r"\b(?:([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("
 )
 TS_IMPORT_RE = re.compile(r"""import(?:\s+type)?\s+.*?\s+from\s+['"]([^'"]+)['"]""")
+TS_NAMED_IMPORT_RE = re.compile(
+    r"""^\s*import(?:\s+type)?\s+\{([^}]*)\}\s+from\s+['"][^'"]+['"]"""
+)
+TS_DEFAULT_IMPORT_RE = re.compile(
+    r"""^\s*import(?:\s+type)?\s+([A-Za-z_][A-Za-z0-9_]*)\s+from\s+['"][^'"]+['"]"""
+)
 PY_FROM_RE = re.compile(r"""from\s+([A-Za-z0-9_\.]+)\s+import""")
 PY_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_\.]+)""")
+PY_FROM_ALIAS_RE = re.compile(r"""^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+(.+)$""")
+PY_IMPORT_ALIAS_RE = re.compile(
+    r"""^\s*import\s+([A-Za-z0-9_\.]+)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$"""
+)
 JAVA_IMPORT_RE = re.compile(r"""import\s+([A-Za-z0-9_.*]+);""")
 GO_IMPORT_RE = re.compile(r'''"([^"]+)"''')
 CALL_KEYWORDS = {
@@ -147,24 +157,84 @@ def _import_hints(source: str) -> set[str]:
     return hints
 
 
+def _import_aliases(source: str) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    for raw_line in source.splitlines():
+        normalized = raw_line.strip()
+        if not normalized:
+            continue
+
+        from_match = PY_FROM_ALIAS_RE.match(normalized)
+        if from_match:
+            imported_items = from_match.group(2)
+            for chunk in imported_items.split(","):
+                token = chunk.strip()
+                if not token:
+                    continue
+                parts = [part.strip() for part in token.split(" as ")]
+                imported = parts[0]
+                alias = parts[1] if len(parts) > 1 else imported
+                aliases.setdefault(alias, set()).add(imported.split(".")[-1])
+            continue
+
+        import_match = PY_IMPORT_ALIAS_RE.match(normalized)
+        if import_match:
+            imported_module = import_match.group(1)
+            alias = import_match.group(2) or imported_module.split(".")[-1]
+            aliases.setdefault(alias, set()).add(imported_module.split(".")[-1])
+            continue
+
+        ts_named = TS_NAMED_IMPORT_RE.match(normalized)
+        if ts_named:
+            imported_items = ts_named.group(1)
+            for chunk in imported_items.split(","):
+                token = chunk.strip()
+                if not token:
+                    continue
+                parts = [part.strip() for part in token.split(" as ")]
+                imported = parts[0]
+                alias = parts[1] if len(parts) > 1 else imported
+                aliases.setdefault(alias, set()).add(imported)
+            continue
+
+        ts_default = TS_DEFAULT_IMPORT_RE.match(normalized)
+        if ts_default:
+            alias = ts_default.group(1)
+            aliases.setdefault(alias, set()).add(alias)
+
+    return aliases
+
+
 def _resolve_targets(
     callsite: CallSite,
     caller: SymbolRecord,
     candidate_symbols: list[SymbolRecord],
     import_hints: set[str],
+    alias_hints: dict[str, set[str]],
 ) -> tuple[list[SymbolRecord], float]:
     callee_name = callsite.callee_name
-    matches = [symbol for symbol in candidate_symbols if symbol.name == callee_name]
+    candidate_names = {callee_name}
+    candidate_names.update(alias_hints.get(callee_name, set()))
+    matches = [symbol for symbol in candidate_symbols if symbol.name in candidate_names]
     if not matches:
         return [], 0.0
 
     receiver = (callsite.receiver_name or "").strip().lower()
-    if receiver in {"self", "cls", "this"} and caller.kind == "method":
+    if caller.kind == "method":
         class_prefix = caller.qualified_name.rsplit(".", maxsplit=1)[0]
-        receiver_scoped = [
+        class_scoped = [
             symbol
             for symbol in matches
             if symbol.kind == "method" and symbol.qualified_name.startswith(f"{class_prefix}.")
+        ]
+        if class_scoped and receiver in {"", "self", "cls", "this"}:
+            return class_scoped, 1.0 if len(class_scoped) == 1 else 0.78
+
+    if receiver and receiver not in {"self", "cls", "this"}:
+        receiver_scoped = [
+            symbol
+            for symbol in matches
+            if symbol.kind == "method" and f".{receiver}." in symbol.qualified_name
         ]
         if receiver_scoped:
             return receiver_scoped, 1.0 if len(receiver_scoped) == 1 else 0.75
@@ -197,9 +267,11 @@ def build_call_edges(
     parsed: ParsedUnit,
     file_symbols: list[SymbolRecord],
     candidate_symbols: list[SymbolRecord],
+    symbol_id_lookup: dict[tuple[str, str], int] | None = None,
 ) -> list[EdgeRecord]:
     callsites = _extract_calls(parsed)
     hints = _import_hints(parsed.source)
+    alias_hints = _import_aliases(parsed.source)
     edges: list[EdgeRecord] = []
     seen: set[tuple[int, int, int]] = set()
 
@@ -212,10 +284,17 @@ def build_call_edges(
             caller,
             candidate_symbols,
             hints,
+            alias_hints,
         )
         for target in targets:
-            source_id = _symbol_id(caller.qualified_name)
-            target_id = _symbol_id(target.qualified_name)
+            if symbol_id_lookup is None:
+                source_id = _symbol_id(caller.qualified_name)
+                target_id = _symbol_id(target.qualified_name)
+            else:
+                source_id = symbol_id_lookup.get((caller.qualified_name, caller.file_path))
+                target_id = symbol_id_lookup.get((target.qualified_name, target.file_path))
+                if source_id is None or target_id is None:
+                    continue
             dedupe_key = (source_id, target_id, callsite.line_number)
             if dedupe_key in seen:
                 continue

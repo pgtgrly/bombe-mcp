@@ -193,6 +193,140 @@ class CallGraphTests(unittest.TestCase):
             self.assertEqual(edges[0].target_id, symbol_id("app.service.Service.render"))
             self.assertEqual(edges[0].confidence, 1.0)
 
+    def test_method_body_unqualified_call_prefers_same_class_method(self) -> None:
+        source = (
+            "class Service:\n"
+            "    def caller(self):\n"
+            "        render()\n"
+            "    def render(self):\n"
+            "        return 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "service.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.service.Service.caller",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                ),
+                SymbolRecord(
+                    name="render",
+                    qualified_name="app.service.Service.render",
+                    kind="method",
+                    file_path=file_path.as_posix(),
+                    start_line=4,
+                    end_line=5,
+                ),
+            ]
+            candidates = file_symbols + [
+                SymbolRecord(
+                    name="render",
+                    qualified_name="pkg.render",
+                    kind="function",
+                    file_path="pkg/render.py",
+                    start_line=1,
+                    end_line=2,
+                )
+            ]
+
+            edges = build_call_edges(parsed, file_symbols, candidates)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.service.Service.render"))
+            self.assertEqual(edges[0].confidence, 1.0)
+
+    def test_alias_import_resolution_prefers_original_symbol_name(self) -> None:
+        source = (
+            "from app.auth import util as helper\n"
+            "def caller():\n"
+            "    helper()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "entry.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="app.entry.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=2,
+                    end_line=3,
+                )
+            ]
+            candidates = file_symbols + [
+                SymbolRecord(
+                    name="util",
+                    qualified_name="app.auth.util",
+                    kind="function",
+                    file_path="app/auth.py",
+                    start_line=1,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="helper",
+                    qualified_name="pkg.helper",
+                    kind="function",
+                    file_path="pkg/helper.py",
+                    start_line=1,
+                    end_line=2,
+                ),
+            ]
+
+            edges = build_call_edges(parsed, file_symbols, candidates)
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].target_id, symbol_id("app.auth.util"))
+            self.assertEqual(edges[0].confidence, 1.0)
+
+    def test_call_edges_can_use_explicit_symbol_id_lookup(self) -> None:
+        source = (
+            "def caller():\n"
+            "    callee()\n"
+            "\n"
+            "def callee():\n"
+            "    return 1\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "mod.py"
+            file_path.write_text(source, encoding="utf-8")
+            parsed = parse_file(file_path, "python")
+            file_symbols = [
+                SymbolRecord(
+                    name="caller",
+                    qualified_name="pkg.mod.caller",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=1,
+                    end_line=2,
+                ),
+                SymbolRecord(
+                    name="callee",
+                    qualified_name="pkg.mod.callee",
+                    kind="function",
+                    file_path=file_path.as_posix(),
+                    start_line=4,
+                    end_line=5,
+                ),
+            ]
+            lookup = {
+                ("pkg.mod.caller", file_path.as_posix()): 101,
+                ("pkg.mod.callee", file_path.as_posix()): 202,
+            }
+            edges = build_call_edges(
+                parsed,
+                file_symbols,
+                file_symbols,
+                symbol_id_lookup=lookup,
+            )
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].source_id, 101)
+            self.assertEqual(edges[0].target_id, 202)
+
 
 if __name__ == "__main__":
     unittest.main()

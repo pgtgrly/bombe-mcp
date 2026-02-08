@@ -29,7 +29,7 @@ class DatabaseTests(unittest.TestCase):
             version = db.query(
                 "SELECT value FROM repo_meta WHERE key = 'schema_version';"
             )
-            self.assertEqual(version[0]["value"], "2")
+            self.assertEqual(version[0]["value"], "3")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,7 +153,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "2")
+            self.assertEqual(version[0]["value"], "3")
             fts_table = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
             )
@@ -162,6 +162,29 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["name"], "run")
                 self.assertEqual(rows[0]["qualified_name"], "src.mod.run")
+
+    def test_init_schema_migrates_from_v2_to_v3_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "bombe.db")
+            db.init_schema()
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO repo_meta(key, value)
+                    VALUES('schema_version', '2')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """
+                )
+                conn.execute("DROP INDEX IF EXISTS idx_edges_file_line;")
+                conn.commit()
+
+            db.init_schema()
+            version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
+            self.assertEqual(version[0]["value"], "3")
+            index_rows = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_edges_file_line';"
+            )
+            self.assertEqual(len(index_rows), 1)
 
 
 if __name__ == "__main__":

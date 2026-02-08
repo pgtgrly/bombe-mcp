@@ -63,6 +63,13 @@ class QueryContextTests(unittest.TestCase):
             self.assertLessEqual(bundle["tokens_used"], bundle["token_budget"])
             self.assertGreaterEqual(bundle["symbols_included"], 1)
             self.assertEqual(bundle["selection_strategy"], "seeded_topology_then_rank")
+            metrics = bundle["quality_metrics"]
+            self.assertGreaterEqual(metrics["seed_hit_rate"], 0.0)
+            self.assertLessEqual(metrics["seed_hit_rate"], 1.0)
+            self.assertGreaterEqual(metrics["connectedness"], 0.0)
+            self.assertLessEqual(metrics["connectedness"], 1.0)
+            self.assertGreaterEqual(metrics["token_efficiency"], 0.0)
+            self.assertLessEqual(metrics["token_efficiency"], 1.0)
             files = bundle["files"]
             symbol_names = [
                 symbol["name"]
@@ -181,6 +188,8 @@ class QueryContextTests(unittest.TestCase):
             self.assertIn("alpha", names)
             self.assertIn("beta", names)
             self.assertNotIn("gamma", names)
+            metrics = response.payload["context_bundle"]["quality_metrics"]
+            self.assertGreater(metrics["connectedness"], 0.0)
 
 
 if __name__ == "__main__":

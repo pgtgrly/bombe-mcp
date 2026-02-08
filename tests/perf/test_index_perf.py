@@ -9,13 +9,10 @@ from pathlib import Path
 from bombe.indexer.pipeline import full_index
 from bombe.store.database import Database
 
-
-def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = int(round((len(ordered) - 1) * percentile))
-    return ordered[max(0, min(index, len(ordered) - 1))]
+try:
+    from tests.perf.perf_utils import percentile, record_metrics
+except ModuleNotFoundError:
+    from perf_utils import percentile, record_metrics
 
 
 @unittest.skipUnless(os.getenv("BOMBE_RUN_PERF") == "1", "Perf tests are opt-in.")
@@ -39,11 +36,19 @@ class IndexPerformanceTests(unittest.TestCase):
             full_index(root, db)
             elapsed = time.perf_counter() - started
             index_ms.append(elapsed * 1000)
+            metrics = {
+                "schema_init_ms_p50": percentile(schema_init_ms, 0.50),
+                "schema_init_ms_p95": percentile(schema_init_ms, 0.95),
+                "full_index_ms_p50": percentile(index_ms, 0.50),
+                "full_index_ms_p95": percentile(index_ms, 0.95),
+            }
+            history_path = record_metrics("index", metrics)
             print(
-                f"[perf][index] schema_init_ms_p50={_percentile(schema_init_ms, 0.50):.2f} "
-                f"schema_init_ms_p95={_percentile(schema_init_ms, 0.95):.2f} "
-                f"full_index_ms_p50={_percentile(index_ms, 0.50):.2f} "
-                f"full_index_ms_p95={_percentile(index_ms, 0.95):.2f}"
+                f"[perf][index] schema_init_ms_p50={metrics['schema_init_ms_p50']:.2f} "
+                f"schema_init_ms_p95={metrics['schema_init_ms_p95']:.2f} "
+                f"full_index_ms_p50={metrics['full_index_ms_p50']:.2f} "
+                f"full_index_ms_p95={metrics['full_index_ms_p95']:.2f} "
+                f"history={history_path}"
             )
             self.assertLess(elapsed, 30.0)
 

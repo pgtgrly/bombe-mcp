@@ -10,13 +10,10 @@ from bombe.indexer.pipeline import full_index, incremental_index
 from bombe.models import FileChange
 from bombe.store.database import Database
 
-
-def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = int(round((len(ordered) - 1) * percentile))
-    return ordered[max(0, min(index, len(ordered) - 1))]
+try:
+    from tests.perf.perf_utils import percentile, record_metrics
+except ModuleNotFoundError:
+    from perf_utils import percentile, record_metrics
 
 
 @unittest.skipUnless(os.getenv("BOMBE_RUN_PERF") == "1", "Perf tests are opt-in.")
@@ -43,11 +40,19 @@ class IncrementalPerformanceTests(unittest.TestCase):
             incremental_index(root, db, [FileChange(status="M", path="src/file_0.py")])
             elapsed_ms = (time.perf_counter() - started) * 1000
             incremental_ms.append(elapsed_ms)
+            metrics = {
+                "baseline_full_index_ms_p50": percentile(baseline_index_ms, 0.50),
+                "baseline_full_index_ms_p95": percentile(baseline_index_ms, 0.95),
+                "incremental_ms_p50": percentile(incremental_ms, 0.50),
+                "incremental_ms_p95": percentile(incremental_ms, 0.95),
+            }
+            history_path = record_metrics("incremental", metrics)
             print(
-                f"[perf][incremental] baseline_full_index_ms_p50={_percentile(baseline_index_ms, 0.50):.2f} "
-                f"baseline_full_index_ms_p95={_percentile(baseline_index_ms, 0.95):.2f} "
-                f"incremental_ms_p50={_percentile(incremental_ms, 0.50):.2f} "
-                f"incremental_ms_p95={_percentile(incremental_ms, 0.95):.2f}"
+                f"[perf][incremental] baseline_full_index_ms_p50={metrics['baseline_full_index_ms_p50']:.2f} "
+                f"baseline_full_index_ms_p95={metrics['baseline_full_index_ms_p95']:.2f} "
+                f"incremental_ms_p50={metrics['incremental_ms_p50']:.2f} "
+                f"incremental_ms_p95={metrics['incremental_ms_p95']:.2f} "
+                f"history={history_path}"
             )
             self.assertLess(elapsed_ms, 500.0)
 

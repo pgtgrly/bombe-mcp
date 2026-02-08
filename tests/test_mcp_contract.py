@@ -81,17 +81,58 @@ class MCPContractTests(unittest.TestCase):
 
             registry = build_tool_registry(db, root.as_posix())
             search_payload = registry["search_symbols"]["handler"]({"query": "auth"})
-            self.assertIn("symbols", search_payload)
+            self.assertEqual(set(search_payload.keys()), {"symbols", "total_matches"})
+            if search_payload["symbols"]:
+                self.assertEqual(
+                    set(search_payload["symbols"][0].keys()),
+                    {
+                        "name",
+                        "qualified_name",
+                        "kind",
+                        "file_path",
+                        "start_line",
+                        "end_line",
+                        "signature",
+                        "visibility",
+                        "importance_score",
+                        "callers_count",
+                        "callees_count",
+                        "match_strategy",
+                        "match_reason",
+                    },
+                )
 
             references_payload = registry["get_references"]["handler"](
                 {"symbol_name": "authenticate", "direction": "callers", "depth": 1}
             )
-            self.assertIn("callers", references_payload)
+            self.assertEqual(
+                set(references_payload.keys()),
+                {"target_symbol", "callers", "callees", "implementors", "supers"},
+            )
+            if references_payload["callers"]:
+                self.assertEqual(
+                    set(references_payload["callers"][0].keys()),
+                    {"name", "file_path", "line", "depth", "reference_reason"},
+                )
 
             context_payload = registry["get_context"]["handler"](
                 {"query": "authenticate flow", "token_budget": 100}
             )
-            self.assertIn("context_bundle", context_payload)
+            self.assertEqual(set(context_payload.keys()), {"query", "context_bundle"})
+            self.assertEqual(
+                set(context_payload["context_bundle"].keys()),
+                {
+                    "summary",
+                    "relationship_map",
+                    "selection_strategy",
+                    "quality_metrics",
+                    "files",
+                    "tokens_used",
+                    "token_budget",
+                    "symbols_included",
+                    "symbols_available",
+                },
+            )
 
             structure_payload = registry["get_structure"]["handler"]({"path": ".", "token_budget": 1000})
             self.assertIsInstance(structure_payload, str)
@@ -99,17 +140,50 @@ class MCPContractTests(unittest.TestCase):
             blast_payload = registry["get_blast_radius"]["handler"](
                 {"symbol_name": "authenticate", "max_depth": 2}
             )
-            self.assertIn("impact", blast_payload)
+            self.assertEqual(set(blast_payload.keys()), {"target", "change_type", "impact"})
+            self.assertEqual(
+                set(blast_payload["impact"].keys()),
+                {
+                    "direct_callers",
+                    "transitive_callers",
+                    "affected_files",
+                    "total_affected_symbols",
+                    "total_affected_files",
+                    "risk_assessment",
+                },
+            )
 
             data_flow_payload = registry["trace_data_flow"]["handler"](
                 {"symbol_name": "authenticate", "direction": "both", "max_depth": 2}
             )
-            self.assertIn("paths", data_flow_payload)
+            self.assertEqual(
+                set(data_flow_payload.keys()),
+                {"target", "direction", "max_depth", "summary", "nodes", "paths"},
+            )
+            if data_flow_payload["paths"]:
+                self.assertEqual(
+                    set(data_flow_payload["paths"][0].keys()),
+                    {"from_id", "from_name", "to_id", "to_name", "line", "depth", "relationship"},
+                )
 
             change_impact_payload = registry["change_impact"]["handler"](
                 {"symbol_name": "authenticate", "max_depth": 2}
             )
-            self.assertIn("impact", change_impact_payload)
+            self.assertEqual(
+                set(change_impact_payload.keys()),
+                {"target", "change_type", "max_depth", "summary", "impact"},
+            )
+            self.assertEqual(
+                set(change_impact_payload["impact"].keys()),
+                {
+                    "direct_callers",
+                    "transitive_callers",
+                    "type_dependents",
+                    "affected_files",
+                    "total_affected_symbols",
+                    "risk_level",
+                },
+            )
 
 
 if __name__ == "__main__":

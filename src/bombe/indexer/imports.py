@@ -123,10 +123,15 @@ def resolve_imports(
     source_file: FileRecord,
     imports: list[ImportRecord],
     all_files: dict[str, FileRecord],
+    file_id_lookup: dict[str, int] | None = None,
 ) -> tuple[list[EdgeRecord], list[ExternalDepRecord]]:
     edges: list[EdgeRecord] = []
     external: list[ExternalDepRecord] = []
-    source_id = _file_id(source_file.path)
+    source_id = (
+        int(file_id_lookup[source_file.path])
+        if file_id_lookup is not None and source_file.path in file_id_lookup
+        else _file_id(source_file.path)
+    )
 
     for import_record in imports:
         module_name = import_record.module_name
@@ -155,7 +160,11 @@ def resolve_imports(
         edges.append(
             EdgeRecord(
                 source_id=source_id,
-                target_id=_file_id(resolved_path),
+                target_id=(
+                    int(file_id_lookup[resolved_path])
+                    if file_id_lookup is not None and resolved_path in file_id_lookup
+                    else _file_id(resolved_path)
+                ),
                 source_type="file",
                 target_type="file",
                 relationship="IMPORTS",

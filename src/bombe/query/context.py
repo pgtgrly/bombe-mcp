@@ -226,6 +226,51 @@ def _topology_order(
     return ordered + remaining
 
 
+def _quality_metrics(
+    included_symbols: list[dict[str, object]],
+    seeds: list[int],
+    token_budget: int,
+    tokens_used: int,
+    adjacency: dict[int, set[int]],
+) -> dict[str, object]:
+    if not included_symbols:
+        return {
+            "seed_hit_rate": 0.0,
+            "connectedness": 0.0,
+            "token_efficiency": 0.0,
+            "avg_depth": 0.0,
+            "included_count": 0,
+        }
+
+    included_ids = {int(symbol["id"]) for symbol in included_symbols}
+    seed_set = set(seeds)
+    included_seed_ids = sorted(included_ids & seed_set)
+    seed_hit_rate = len(included_seed_ids) / max(1, len(seed_set))
+
+    connected_ids: set[int] = set()
+    queue = deque(included_seed_ids)
+    while queue:
+        current = queue.popleft()
+        if current in connected_ids:
+            continue
+        connected_ids.add(current)
+        for neighbor in adjacency.get(current, set()):
+            if neighbor in included_ids and neighbor not in connected_ids:
+                queue.append(neighbor)
+    connectedness = len(connected_ids) / max(1, len(included_ids))
+
+    avg_depth = sum(int(symbol["depth"]) for symbol in included_symbols) / max(1, len(included_symbols))
+    token_efficiency = tokens_used / max(1, token_budget)
+
+    return {
+        "seed_hit_rate": round(seed_hit_rate, 4),
+        "connectedness": round(connectedness, 4),
+        "token_efficiency": round(token_efficiency, 4),
+        "avg_depth": round(avg_depth, 4),
+        "included_count": len(included_symbols),
+    }
+
+
 def get_context(db: Database, req: ContextRequest) -> ContextResponse:
     with closing(db.connect()) as conn:
         seeds = _pick_seeds(conn, req)
@@ -341,6 +386,13 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
 
         summary = f"Selected {len(included_symbols)} symbols from {len(file_entries)} files."
         relationship_map = " -> ".join(str(symbol["name"]) for symbol in included_symbols[:8])
+        quality_metrics = _quality_metrics(
+            included_symbols=included_symbols,
+            seeds=seeds,
+            token_budget=req.token_budget,
+            tokens_used=tokens_used,
+            adjacency=adjacency,
+        )
 
         payload = {
             "query": req.query,
@@ -348,6 +400,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 "summary": summary,
                 "relationship_map": relationship_map,
                 "selection_strategy": "seeded_topology_then_rank",
+                "quality_metrics": quality_metrics,
                 "files": file_entries,
                 "tokens_used": tokens_used,
                 "token_budget": req.token_budget,

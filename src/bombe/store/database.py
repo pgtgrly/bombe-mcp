@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_STATEMENTS = (
     """
@@ -90,6 +90,7 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, source_type);",
     "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, target_type);",
     "CREATE INDEX IF NOT EXISTS idx_edges_relationship ON edges(relationship);",
+    "CREATE INDEX IF NOT EXISTS idx_edges_file_line ON edges(file_path, line_number);",
     "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);",
 )
 
@@ -128,11 +129,19 @@ class Database:
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         current_version = self._get_schema_version(conn)
-        if current_version >= SCHEMA_VERSION:
-            return
-        if current_version < 2:
-            self._migrate_to_v2(conn)
-        self._set_schema_version(conn, SCHEMA_VERSION)
+        while current_version < SCHEMA_VERSION:
+            next_version = current_version + 1
+            if next_version == 1:
+                self._migrate_to_v1(conn)
+            elif next_version == 2:
+                self._migrate_to_v2(conn)
+            elif next_version == 3:
+                self._migrate_to_v3(conn)
+            self._set_schema_version(conn, next_version)
+            current_version = next_version
+
+    def _migrate_to_v1(self, conn: sqlite3.Connection) -> None:
+        del conn
 
     def _migrate_to_v2(self, conn: sqlite3.Connection) -> None:
         try:
@@ -165,6 +174,11 @@ class Database:
                     row["signature"],
                 ),
             )
+
+    def _migrate_to_v3(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_file_line ON edges(file_path, line_number);"
+        )
 
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         row = conn.execute(

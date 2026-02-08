@@ -47,9 +47,10 @@ def trace_data_flow(
         }
 
         while queue:
-            current_id, depth, role = queue.popleft()
+            current_id, depth, _role = queue.popleft()
             if depth >= max_depth:
                 continue
+            current_name = str(nodes.get(current_id, {}).get("name", ""))
 
             if direction in {"upstream", "both"}:
                 upstream_rows = conn.execute(
@@ -80,6 +81,7 @@ def trace_data_flow(
                             "from_id": neighbor_id,
                             "from_name": row["name"],
                             "to_id": current_id,
+                            "to_name": current_name,
                             "line": int(row["line_number"]) if row["line_number"] is not None else 0,
                             "depth": depth + 1,
                             "relationship": "CALLS",
@@ -117,6 +119,7 @@ def trace_data_flow(
                     paths.append(
                         {
                             "from_id": current_id,
+                            "from_name": current_name,
                             "to_id": neighbor_id,
                             "to_name": row["name"],
                             "line": int(row["line_number"]) if row["line_number"] is not None else 0,

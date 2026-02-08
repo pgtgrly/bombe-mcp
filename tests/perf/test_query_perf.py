@@ -13,13 +13,10 @@ from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.store.database import Database
 
-
-def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = int(round((len(ordered) - 1) * percentile))
-    return ordered[max(0, min(index, len(ordered) - 1))]
+try:
+    from tests.perf.perf_utils import percentile, record_metrics
+except ModuleNotFoundError:
+    from perf_utils import percentile, record_metrics
 
 
 @unittest.skipUnless(os.getenv("BOMBE_RUN_PERF") == "1", "Perf tests are opt-in.")
@@ -58,17 +55,29 @@ class QueryPerformanceTests(unittest.TestCase):
                 get_context(db, ContextRequest(query="func_1 flow", token_budget=500))
                 context_latencies.append((time.perf_counter() - start) * 1000)
 
-            search_p50 = _percentile(search_latencies, 0.50)
-            search_p95 = _percentile(search_latencies, 0.95)
-            refs_p50 = _percentile(refs_latencies, 0.50)
-            refs_p95 = _percentile(refs_latencies, 0.95)
-            ctx_p50 = _percentile(context_latencies, 0.50)
-            ctx_p95 = _percentile(context_latencies, 0.95)
+            search_p50 = percentile(search_latencies, 0.50)
+            search_p95 = percentile(search_latencies, 0.95)
+            refs_p50 = percentile(refs_latencies, 0.50)
+            refs_p95 = percentile(refs_latencies, 0.95)
+            ctx_p50 = percentile(context_latencies, 0.50)
+            ctx_p95 = percentile(context_latencies, 0.95)
+            history_path = record_metrics(
+                "query",
+                {
+                    "search_ms_p50": search_p50,
+                    "search_ms_p95": search_p95,
+                    "references_ms_p50": refs_p50,
+                    "references_ms_p95": refs_p95,
+                    "context_ms_p50": ctx_p50,
+                    "context_ms_p95": ctx_p95,
+                },
+            )
             print(
                 "[perf][query] "
                 f"search_ms_p50={search_p50:.2f} search_ms_p95={search_p95:.2f} "
                 f"references_ms_p50={refs_p50:.2f} references_ms_p95={refs_p95:.2f} "
-                f"context_ms_p50={ctx_p50:.2f} context_ms_p95={ctx_p95:.2f}"
+                f"context_ms_p50={ctx_p50:.2f} context_ms_p95={ctx_p95:.2f} "
+                f"history={history_path}"
             )
 
             self.assertLess(search_p95, 20.0)
