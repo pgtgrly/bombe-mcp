@@ -1004,6 +1004,7 @@ class Database:
     def list_indexing_diagnostics(
         self,
         limit: int = 100,
+        offset: int = 0,
         run_id: str | None = None,
         stage: str | None = None,
         severity: str | None = None,
@@ -1037,9 +1038,10 @@ class Database:
             FROM indexing_diagnostics
             {where_sql}
             ORDER BY id DESC
-            LIMIT ?;
+            LIMIT ? OFFSET ?;
         """
         params.append(max(1, limit))
+        params.append(max(0, offset))
         return self.query(query, tuple(params))
 
     def summarize_indexing_diagnostics(self, run_id: str | None = None) -> dict[str, Any]:

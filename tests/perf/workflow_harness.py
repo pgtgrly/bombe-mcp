@@ -17,10 +17,7 @@ from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.store.database import Database
 
-try:
-    from tests.perf.perf_utils import percentile
-except ModuleNotFoundError:
-    from perf_utils import percentile
+from tests.perf.perf_utils import percentile
 
 
 @dataclass(frozen=True)

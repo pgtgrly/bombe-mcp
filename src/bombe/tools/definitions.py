@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from bombe.models import (
@@ -54,6 +55,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "file_pattern": {"type": "string"},
             "limit": {"type": "integer", "default": 20},
+            "offset": {"type": "integer", "default": 0},
             "include_explanations": {"type": "boolean", "default": False},
             "include_plan": {"type": "boolean", "default": False},
         },
@@ -150,6 +152,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "stage": {"type": "string"},
             "severity": {"type": "string"},
             "limit": {"type": "integer", "default": 50},
+            "offset": {"type": "integer", "default": 0},
             "include_summary": {"type": "boolean", "default": True},
         },
     },
@@ -179,6 +182,27 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "expansion_depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
         },
         "required": ["query"],
+    },
+    "get_entry_points": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 20},
+            "include_tests": {"type": "boolean", "default": False},
+        },
+    },
+    "get_hot_paths": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 20},
+            "include_tests": {"type": "boolean", "default": False},
+        },
+    },
+    "get_orphan_symbols": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 50},
+            "include_tests": {"type": "boolean", "default": False},
+        },
     },
 }
 
@@ -213,6 +237,43 @@ def _cache_version_token(db: Database) -> str:
         return str(db.get_cache_epoch())
     except Exception:
         return "1"
+
+
+def _tool_metrics_summary(db: Database, limit: int = 200) -> dict[str, Any]:
+    rows = db.query(
+        """
+        SELECT latency_ms, success, mode
+        FROM tool_metrics
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (max(1, limit),),
+    )
+    latencies = sorted(float(row["latency_ms"]) for row in rows)
+    total_calls = len(rows)
+    success_calls = sum(1 for row in rows if int(row["success"]) == 1)
+    failure_calls = total_calls - success_calls
+    by_mode: dict[str, int] = {}
+    for row in rows:
+        mode = str(row["mode"])
+        by_mode[mode] = by_mode.get(mode, 0) + 1
+    p50_latency_ms = 0.0
+    p95_latency_ms = 0.0
+    if latencies:
+        p50_index = min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.5)))
+        p95_index = min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.95)))
+        p50_latency_ms = round(latencies[p50_index], 3)
+        p95_latency_ms = round(latencies[p95_index], 3)
+    return {
+        "window_size": total_calls,
+        "total_calls": total_calls,
+        "success_calls": success_calls,
+        "failure_calls": failure_calls,
+        "success_rate": round(success_calls / max(1, total_calls), 4),
+        "by_mode": by_mode,
+        "p50_latency_ms": p50_latency_ms,
+        "p95_latency_ms": p95_latency_ms,
+    }
 
 
 def _with_explanations(
@@ -344,16 +405,28 @@ def _instrument_handler(
 
 
 def _search_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT)
+    offset = max(0, int(payload.get("offset", 0)))
+    request_limit = clamp_limit(limit + offset, maximum=MAX_SEARCH_LIMIT)
     response = search_symbols(
         db,
         SymbolSearchRequest(
             query=truncate_query(str(payload["query"])),
             kind=str(payload.get("kind", "any")),
             file_pattern=payload.get("file_pattern"),
-            limit=clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT),
+            limit=request_limit,
         ),
     )
-    base = {"symbols": response.symbols, "total_matches": response.total_matches}
+    paged_symbols = response.symbols[offset: offset + limit]
+    base: dict[str, Any] = {"symbols": paged_symbols, "total_matches": response.total_matches}
+    if "offset" in payload or offset > 0:
+        next_offset = offset + len(paged_symbols)
+        base["pagination"] = {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(paged_symbols),
+            "next_offset": next_offset if next_offset < int(response.total_matches) else None,
+        }
     return _with_explanations("search_symbols", payload, base)
 
 
@@ -449,6 +522,7 @@ def _change_impact_handler(db: Database, payload: dict[str, Any]) -> dict[str, A
 
 def _indexing_diagnostics_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     limit = max(1, int(payload.get("limit", 50)))
+    offset = max(0, int(payload.get("offset", 0)))
     run_id_raw = payload.get("run_id")
     stage_raw = payload.get("stage")
     severity_raw = payload.get("severity")
@@ -457,10 +531,13 @@ def _indexing_diagnostics_handler(db: Database, payload: dict[str, Any]) -> dict
     severity = str(severity_raw) if severity_raw else None
     diagnostics = db.list_indexing_diagnostics(
         limit=limit,
+        offset=offset,
         run_id=run_id,
         stage=stage,
         severity=severity,
     )
+    summary = db.summarize_indexing_diagnostics(run_id=run_id)
+    total = int(summary.get("total", 0))
     response = {
         "diagnostics": diagnostics,
         "count": len(diagnostics),
@@ -469,10 +546,20 @@ def _indexing_diagnostics_handler(db: Database, payload: dict[str, Any]) -> dict
             "stage": stage,
             "severity": severity,
             "limit": limit,
+            "offset": offset,
         },
     }
+    if "offset" in payload or offset > 0:
+        next_offset = offset + len(diagnostics)
+        response["pagination"] = {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(diagnostics),
+            "next_offset": next_offset if next_offset < total else None,
+            "total": total,
+        }
     if bool(payload.get("include_summary", True)):
-        response["summary"] = db.summarize_indexing_diagnostics(run_id=run_id)
+        response["summary"] = summary
     return response
 
 
@@ -480,6 +567,7 @@ def _server_status_handler(
     db: Database,
     repo_root: str,
     payload: dict[str, Any],
+    planner: QueryPlanner | None = None,
 ) -> dict[str, Any]:
     diagnostics_limit = max(1, int(payload.get("diagnostics_limit", 20)))
     metrics_limit = max(1, int(payload.get("metrics_limit", 20)))
@@ -490,6 +578,7 @@ def _server_status_handler(
         "SELECT COUNT(*) AS count FROM sync_queue WHERE status IN ('queued', 'retry');"
     )
     diagnostics_summary = db.summarize_indexing_diagnostics()
+    metrics_summary = _tool_metrics_summary(db, limit=max(metrics_limit, 50))
     return {
         "repo_root": repo_root,
         "db_path": db.db_path.as_posix(),
@@ -505,6 +594,8 @@ def _server_status_handler(
         },
         "indexing_diagnostics_summary": diagnostics_summary,
         "recent_indexing_diagnostics": db.list_indexing_diagnostics(limit=diagnostics_limit),
+        "tool_metrics_summary": metrics_summary,
+        "planner_cache": planner.stats() if planner is not None else {"entries": 0, "max_entries": 0},
         "recent_tool_metrics": db.query(
             """
             SELECT tool_name, latency_ms, success, mode, result_size, error_message, created_at
@@ -615,6 +706,132 @@ def _context_summary_handler(db: Database, payload: dict[str, Any]) -> dict[str,
     }
 
 
+def _symbol_graph_rows(db: Database) -> list[dict[str, Any]]:
+    return db.query(
+        """
+        SELECT
+            s.id,
+            s.name,
+            s.qualified_name,
+            s.kind,
+            s.file_path,
+            s.start_line,
+            s.end_line,
+            s.pagerank_score,
+            (
+                SELECT COUNT(*)
+                FROM edges e
+                WHERE e.target_type = 'symbol' AND e.target_id = s.id
+            ) AS inbound_count,
+            (
+                SELECT COUNT(*)
+                FROM edges e
+                WHERE e.source_type = 'symbol' AND e.source_id = s.id
+            ) AS outbound_count
+        FROM symbols s
+        ORDER BY s.qualified_name ASC;
+        """
+    )
+
+
+def _is_test_path(path: str) -> bool:
+    lowered = path.lower()
+    return "/test" in lowered or "\\test" in lowered or lowered.endswith("_test.py")
+
+
+def _entry_point_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT)
+    include_tests = bool(payload.get("include_tests", False))
+    rows = _symbol_graph_rows(db)
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        file_path = str(row["file_path"])
+        if not include_tests and _is_test_path(file_path):
+            continue
+        file_name = Path(file_path).name.lower()
+        role_bonus = 0.0
+        if file_name.startswith(("main", "app", "server", "cli", "index")):
+            role_bonus = 0.35
+        inbound = int(row["inbound_count"] or 0)
+        outbound = int(row["outbound_count"] or 0)
+        pagerank = float(row["pagerank_score"] or 0.0)
+        score = round((pagerank * 0.6) + (inbound * 0.25) + (outbound * 0.1) + role_bonus, 6)
+        scored.append(
+            {
+                "name": str(row["name"]),
+                "qualified_name": str(row["qualified_name"]),
+                "kind": str(row["kind"]),
+                "file_path": file_path,
+                "start_line": int(row["start_line"]),
+                "end_line": int(row["end_line"]),
+                "pagerank_score": pagerank,
+                "inbound_count": inbound,
+                "outbound_count": outbound,
+                "entry_score": score,
+            }
+        )
+    scored.sort(
+        key=lambda row: (-float(row["entry_score"]), str(row["qualified_name"]), str(row["file_path"]))
+    )
+    return {"entry_points": scored[:limit], "total_candidates": len(scored)}
+
+
+def _hot_paths_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT)
+    include_tests = bool(payload.get("include_tests", False))
+    rows = _symbol_graph_rows(db)
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        file_path = str(row["file_path"])
+        if not include_tests and _is_test_path(file_path):
+            continue
+        inbound = int(row["inbound_count"] or 0)
+        outbound = int(row["outbound_count"] or 0)
+        pagerank = float(row["pagerank_score"] or 0.0)
+        hot_score = round((inbound * 2.0) + (outbound * 1.0) + (pagerank * 10.0), 6)
+        scored.append(
+            {
+                "name": str(row["name"]),
+                "qualified_name": str(row["qualified_name"]),
+                "kind": str(row["kind"]),
+                "file_path": file_path,
+                "inbound_count": inbound,
+                "outbound_count": outbound,
+                "pagerank_score": pagerank,
+                "hot_score": hot_score,
+            }
+        )
+    scored.sort(key=lambda row: (-float(row["hot_score"]), str(row["qualified_name"])))
+    return {"hot_paths": scored[:limit], "total_candidates": len(scored)}
+
+
+def _orphan_symbols_handler(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = max(1, int(payload.get("limit", 50)))
+    include_tests = bool(payload.get("include_tests", False))
+    rows = _symbol_graph_rows(db)
+    orphaned: list[dict[str, Any]] = []
+    for row in rows:
+        file_path = str(row["file_path"])
+        if not include_tests and _is_test_path(file_path):
+            continue
+        inbound = int(row["inbound_count"] or 0)
+        if inbound != 0:
+            continue
+        orphaned.append(
+            {
+                "name": str(row["name"]),
+                "qualified_name": str(row["qualified_name"]),
+                "kind": str(row["kind"]),
+                "file_path": file_path,
+                "start_line": int(row["start_line"]),
+                "end_line": int(row["end_line"]),
+                "reason": "no_inbound_edges",
+            }
+        )
+    orphaned.sort(key=lambda row: (str(row["file_path"]), str(row["qualified_name"])))
+    return {"orphan_symbols": orphaned[:limit], "total_orphans": len(orphaned)}
+
+
 def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
     planner = QueryPlanner(max_entries=1024, ttl_seconds=30.0)
     search_handler = _instrument_handler(
@@ -668,7 +885,7 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
     status_handler = _instrument_handler(
         db,
         "get_server_status",
-        lambda payload: _server_status_handler(db, repo_root, payload),
+        lambda payload: _server_status_handler(db, repo_root, payload, planner=planner),
         planner=None,
     )
     estimate_context_handler = _instrument_handler(
@@ -681,6 +898,24 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
         db,
         "get_context_summary",
         lambda payload: _context_summary_handler(db, payload),
+        planner=planner,
+    )
+    entry_points_handler = _instrument_handler(
+        db,
+        "get_entry_points",
+        lambda payload: _entry_point_handler(db, payload),
+        planner=planner,
+    )
+    hot_paths_handler = _instrument_handler(
+        db,
+        "get_hot_paths",
+        lambda payload: _hot_paths_handler(db, payload),
+        planner=planner,
+    )
+    orphan_symbols_handler = _instrument_handler(
+        db,
+        "get_orphan_symbols",
+        lambda payload: _orphan_symbols_handler(db, payload),
         planner=planner,
     )
     return {
@@ -738,6 +973,21 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
             "description": "Return module-level context summaries for a query.",
             "input_schema": TOOL_SCHEMAS["get_context_summary"],
             "handler": context_summary_handler,
+        },
+        "get_entry_points": {
+            "description": "Return likely entry points for navigating the repository graph.",
+            "input_schema": TOOL_SCHEMAS["get_entry_points"],
+            "handler": entry_points_handler,
+        },
+        "get_hot_paths": {
+            "description": "Return symbols with the highest callgraph traffic and centrality.",
+            "input_schema": TOOL_SCHEMAS["get_hot_paths"],
+            "handler": hot_paths_handler,
+        },
+        "get_orphan_symbols": {
+            "description": "Return symbols with no inbound references.",
+            "input_schema": TOOL_SCHEMAS["get_orphan_symbols"],
+            "handler": orphan_symbols_handler,
         },
     }
 

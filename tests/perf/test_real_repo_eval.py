@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-try:
-    from tests.perf.real_repo_harness import get_real_repo_paths, run_real_repo_eval
-except ModuleNotFoundError:
-    from real_repo_harness import get_real_repo_paths, run_real_repo_eval
+from tests.perf.real_repo_harness import get_real_repo_paths, run_real_repo_eval
 
 
 class RealRepoEvalTests(unittest.TestCase):

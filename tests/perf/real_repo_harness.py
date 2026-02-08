@@ -11,11 +11,7 @@ from bombe.models import ContextRequest, SymbolSearchRequest
 from bombe.query.context import get_context
 from bombe.query.search import search_symbols
 from bombe.store.database import Database
-
-try:
-    from tests.perf.perf_utils import record_metrics
-except ModuleNotFoundError:
-    from perf_utils import record_metrics
+from tests.perf.perf_utils import record_metrics
 
 
 @dataclass(frozen=True)

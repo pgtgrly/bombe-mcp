@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-try:
-    from tests.perf.workflow_harness import WorkflowThresholds, run_workflow_benchmark
-except ModuleNotFoundError:
-    from perf.workflow_harness import WorkflowThresholds, run_workflow_benchmark
+from tests.perf.workflow_harness import WorkflowThresholds, run_workflow_benchmark
 
 
 class CorrectnessGateTests(unittest.TestCase):

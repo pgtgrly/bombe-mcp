@@ -8,11 +8,7 @@ from bombe.indexer.pipeline import full_index
 from bombe.models import SymbolSearchRequest
 from bombe.query.search import search_symbols
 from bombe.store.database import Database
-
-try:
-    from tests.perf.perf_utils import record_metrics
-except ModuleNotFoundError:
-    from perf_utils import record_metrics
+from tests.perf.perf_utils import record_metrics
 
 
 def _write(path: Path, content: str) -> None:

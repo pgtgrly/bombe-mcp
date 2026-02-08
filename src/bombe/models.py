@@ -246,6 +246,8 @@ class IndexStats:
     elapsed_ms: int
     run_id: str | None = None
     diagnostics_summary: dict[str, Any] = field(default_factory=dict)
+    indexing_telemetry: dict[str, Any] = field(default_factory=dict)
+    progress_snapshots: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

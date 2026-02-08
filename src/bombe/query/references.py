@@ -192,7 +192,10 @@ def get_references(db: Database, req: ReferenceRequest) -> ReferenceResponse:
             )
             results: list[dict[str, object]] = []
             for next_id, line_number, depth, relationship in entries:
-                info = _load_symbol(conn, next_id)
+                try:
+                    info = _load_symbol(conn, next_id)
+                except ValueError:
+                    continue
                 item: dict[str, object] = {
                     "name": info["name"],
                     "file_path": info["file_path"],

@@ -193,6 +193,49 @@ class QueryContextTests(unittest.TestCase):
             metrics = response.payload["context_bundle"]["quality_metrics"]
             self.assertGreater(metrics["connectedness"], 0.0)
 
+    def test_get_context_redacts_sensitive_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            file_path = root / "secret.py"
+            file_path.write_text(
+                "def secret_fn():\n    token = 'sk-1234567890ABCDEFGHIJKLMNOP'\n    return token\n",
+                encoding="utf-8",
+            )
+            db = Database(root / "bombe.db")
+            db.init_schema()
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    "INSERT INTO files(path, language, content_hash, size_bytes) VALUES (?, 'python', 'h1', 10);",
+                    (file_path.as_posix(),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO symbols(name, qualified_name, kind, file_path, start_line, end_line, signature, pagerank_score)
+                    VALUES ('secret_fn', 'svc.secret_fn', 'function', ?, 1, 3, 'def secret_fn()', 0.9);
+                    """,
+                    (file_path.as_posix(),),
+                )
+                conn.commit()
+
+            response = get_context(
+                db,
+                ContextRequest(
+                    query="secret token",
+                    entry_points=["svc.secret_fn"],
+                    token_budget=500,
+                    expansion_depth=1,
+                ),
+            )
+            files = response.payload["context_bundle"]["files"]
+            self.assertGreaterEqual(len(files), 1)
+            source_blob = "\n".join(
+                symbol["source"] for file in files for symbol in file["symbols"]
+            )
+            self.assertNotIn("sk-1234567890ABCDEFGHIJKLMNOP", source_blob)
+            self.assertIn("[REDACTED]", source_blob)
+            metrics = response.payload["context_bundle"]["quality_metrics"]
+            self.assertGreaterEqual(int(metrics["redaction_hits"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

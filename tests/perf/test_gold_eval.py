@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-try:
-    from tests.perf.gold_query_harness import evaluate_gold_queries
-except ModuleNotFoundError:
-    from gold_query_harness import evaluate_gold_queries
+from tests.perf.gold_query_harness import evaluate_gold_queries
 
 
 class GoldEvalTests(unittest.TestCase):

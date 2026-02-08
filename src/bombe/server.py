@@ -210,6 +210,12 @@ def _stats_to_payload(stats: Any, mode: str, changed_files: list[FileChange] | N
     diagnostics_summary = getattr(stats, "diagnostics_summary", None)
     if isinstance(diagnostics_summary, dict):
         payload["diagnostics"] = diagnostics_summary
+    indexing_telemetry = getattr(stats, "indexing_telemetry", None)
+    if isinstance(indexing_telemetry, dict):
+        payload["indexing_telemetry"] = indexing_telemetry
+    progress_snapshots = getattr(stats, "progress_snapshots", None)
+    if isinstance(progress_snapshots, list):
+        payload["progress"] = progress_snapshots
     return payload
 
 
@@ -282,7 +288,6 @@ def _run_incremental_index(
     changes: list[FileChange] | None = None,
     args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
-    del workers
     include_patterns = _pattern_list(getattr(args, "include", [])) if args is not None else []
     exclude_patterns = _pattern_list(getattr(args, "exclude", [])) if args is not None else []
     if changes is None:
@@ -304,7 +309,7 @@ def _run_incremental_index(
                 sort_keys=True,
             ),
         )
-    stats = incremental_index(repo_root, db, resolved_changes)
+    stats = incremental_index(repo_root, db, resolved_changes, workers=max(1, workers))
     payload = _stats_to_payload(stats, mode="incremental", changed_files=resolved_changes)
     logging.getLogger(__name__).info(
         "Incremental index complete: changed=%d files_indexed=%d symbols=%d edges=%d elapsed_ms=%d",
@@ -362,6 +367,43 @@ def _run_hybrid_sync(
     return payload
 
 
+def _tool_metrics_summary(db: Database, limit: int = 200) -> dict[str, Any]:
+    rows = db.query(
+        """
+        SELECT latency_ms, success, mode
+        FROM tool_metrics
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (max(1, limit),),
+    )
+    latencies = sorted(float(row["latency_ms"]) for row in rows)
+    total_calls = len(rows)
+    success_calls = sum(1 for row in rows if int(row["success"]) == 1)
+    failure_calls = total_calls - success_calls
+    by_mode: dict[str, int] = {}
+    for row in rows:
+        mode = str(row["mode"])
+        by_mode[mode] = by_mode.get(mode, 0) + 1
+    p50_latency_ms = 0.0
+    p95_latency_ms = 0.0
+    if latencies:
+        p50_index = min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.5)))
+        p95_index = min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.95)))
+        p50_latency_ms = round(latencies[p50_index], 3)
+        p95_latency_ms = round(latencies[p95_index], 3)
+    return {
+        "window_size": total_calls,
+        "total_calls": total_calls,
+        "success_calls": success_calls,
+        "failure_calls": failure_calls,
+        "success_rate": round(success_calls / max(1, total_calls), 4),
+        "by_mode": by_mode,
+        "p50_latency_ms": p50_latency_ms,
+        "p95_latency_ms": p95_latency_ms,
+    }
+
+
 def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) -> dict[str, Any]:
     schema_row = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
     schema_version = int(schema_row[0]["value"]) if schema_row else 0
@@ -392,6 +434,7 @@ def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) 
     diagnostics_limit = max(1, diagnostics_limit)
     diagnostics_summary = db.summarize_indexing_diagnostics()
     recent_diagnostics = db.list_indexing_diagnostics(limit=diagnostics_limit)
+    tool_metrics_summary = _tool_metrics_summary(db)
     error_count = int(diagnostics_summary.get("by_severity", {}).get("error", 0))
     return {
         "repo_root": repo_root.as_posix(),
@@ -410,6 +453,15 @@ def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) 
         "latest_indexed_files": latest,
         "indexing_diagnostics_summary": diagnostics_summary,
         "recent_indexing_diagnostics": recent_diagnostics,
+        "tool_metrics_summary": tool_metrics_summary,
+        "recent_tool_metrics": db.query(
+            """
+            SELECT tool_name, latency_ms, success, mode, result_size, error_message, created_at
+            FROM tool_metrics
+            ORDER BY id DESC
+            LIMIT 20;
+            """
+        ),
         "latest_pins": db.query(
             """
             SELECT repo_id, snapshot_id, artifact_id, pinned_at
@@ -624,7 +676,7 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
     checks.append(
         {
             "name": "tool_registry",
-            "status": "ok" if len(tool_registry) >= 11 else "degraded",
+            "status": "ok" if len(tool_registry) >= 14 else "degraded",
             "detail": {"tool_count": len(tool_registry)},
         }
     )

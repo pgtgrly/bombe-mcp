@@ -77,6 +77,10 @@ class ServerCLITests(unittest.TestCase):
             self.assertGreaterEqual(int(full_payload["files_indexed"]), 1)
             self.assertIn("run_id", full_payload)
             self.assertIn("diagnostics", full_payload)
+            self.assertIn("indexing_telemetry", full_payload)
+            self.assertIn("progress", full_payload)
+            progress_points = [int(point["progress_pct"]) for point in full_payload["progress"]]
+            self.assertEqual(progress_points, sorted(progress_points))
             self.assertIn("sync", full_payload)
             self.assertEqual(full_payload["sync"]["push"]["reason"], "pushed")
 

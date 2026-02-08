@@ -422,6 +422,9 @@ class DatabaseTests(unittest.TestCase):
             latest = db.list_indexing_diagnostics(limit=2)
             self.assertEqual(len(latest), 2)
             self.assertEqual(str(latest[0]["run_id"]), "run_b")
+            paged = db.list_indexing_diagnostics(limit=1, offset=1)
+            self.assertEqual(len(paged), 1)
+            self.assertEqual(str(paged[0]["run_id"]), "run_a")
 
             parse_only = db.list_indexing_diagnostics(limit=10, run_id="run_a", stage="parse")
             self.assertEqual(len(parse_only), 1)

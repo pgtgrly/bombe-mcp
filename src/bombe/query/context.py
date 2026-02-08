@@ -25,6 +25,21 @@ from bombe.query.tokenizer import estimate_tokens
 
 RELATIONSHIPS = ("CALLS", "IMPORTS_SYMBOL", "EXTENDS", "IMPLEMENTS", "HAS_METHOD")
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
+REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[REDACTED_OPENAI_KEY]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_ACCESS_KEY]"),
+    (
+        re.compile(r"(?i)(api[_-]?key|token|secret)\s*[:=]\s*['\"][^'\"]+['\"]"),
+        r"\1=\"[REDACTED]\"",
+    ),
+    (
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA )?PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "[REDACTED_PRIVATE_KEY]",
+    ),
+)
 
 
 def _resolve_path(file_path: str) -> Path:
@@ -63,6 +78,15 @@ def _symbol_query_relevance(
                 score += 1
                 break
     return score
+
+
+def _redact_sensitive_text(text: str) -> tuple[str, int]:
+    redacted = text
+    redaction_hits = 0
+    for pattern, replacement in REDACTION_PATTERNS:
+        redacted, count = pattern.subn(replacement, redacted)
+        redaction_hits += count
+    return redacted, redaction_hits
 
 
 def _pick_seeds(conn, req: ContextRequest) -> list[int]:
@@ -267,6 +291,7 @@ def _quality_metrics(
     tokens_used: int,
     adjacency: dict[int, set[int]],
     duplicate_skips: int = 0,
+    redaction_hits: int = 0,
 ) -> dict[str, object]:
     if not included_symbols:
         return {
@@ -276,6 +301,7 @@ def _quality_metrics(
             "avg_depth": 0.0,
             "included_count": 0,
             "dedupe_ratio": 1.0,
+            "redaction_hits": int(redaction_hits),
         }
 
     included_ids = {int(symbol["id"]) for symbol in included_symbols}
@@ -308,6 +334,7 @@ def _quality_metrics(
             len(included_symbols) / max(1, len(included_symbols) + duplicate_skips),
             4,
         ),
+        "redaction_hits": int(redaction_hits),
     }
 
 
@@ -406,6 +433,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
         included_symbols: list[dict[str, object]] = []
         seen_bundle_keys: set[tuple[str, str, str]] = set()
         duplicate_skips = 0
+        redaction_hits = 0
         for symbol_id, topology_reason in topology_order:
             if len(included_symbols) >= dynamic_node_cap:
                 break
@@ -422,6 +450,8 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
                 mode = "full_source"
             if not include_full:
                 source = str(symbol["signature"])
+            source, source_redaction_hits = _redact_sensitive_text(source)
+            redaction_hits += source_redaction_hits
             bundle_key = (
                 str(symbol["qualified_name"]),
                 str(symbol["file_path"]),
@@ -484,6 +514,7 @@ def get_context(db: Database, req: ContextRequest) -> ContextResponse:
             tokens_used=tokens_used,
             adjacency=adjacency,
             duplicate_skips=duplicate_skips,
+            redaction_hits=redaction_hits,
         )
 
         payload = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from bombe.indexer.filesystem import compute_content_hash, detect_language, iter_repo_files
@@ -52,6 +53,26 @@ class FilesystemTests(unittest.TestCase):
                 )
             )
             self.assertEqual(included, ["src/a.py"])
+
+    def test_iter_repo_files_excludes_sensitive_paths_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            (root / "secrets.yaml").write_text("api_key: abc\n", encoding="utf-8")
+            (root / "src.py").write_text("print('ok')\n", encoding="utf-8")
+
+            files = sorted(path.relative_to(root).as_posix() for path in iter_repo_files(root))
+            self.assertEqual(files, ["src.py"])
+
+    def test_iter_repo_files_allows_sensitive_paths_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            (root / "src.py").write_text("print('ok')\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {"BOMBE_EXCLUDE_SENSITIVE": "0"}, clear=False):
+                files = sorted(path.relative_to(root).as_posix() for path in iter_repo_files(root))
+            self.assertIn(".env", files)
+            self.assertIn("src.py", files)
 
     def test_detect_language_uses_extension_mapping(self) -> None:
         self.assertEqual(detect_language(Path("src/main.py")), "python")

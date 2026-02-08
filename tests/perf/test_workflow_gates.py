@@ -3,12 +3,8 @@ from __future__ import annotations
 import os
 import unittest
 
-try:
-    from tests.perf.perf_utils import record_metrics
-    from tests.perf.workflow_harness import run_workflow_benchmark
-except ModuleNotFoundError:
-    from perf_utils import record_metrics
-    from workflow_harness import run_workflow_benchmark
+from tests.perf.perf_utils import record_metrics
+from tests.perf.workflow_harness import run_workflow_benchmark
 
 
 @unittest.skipUnless(os.getenv("BOMBE_RUN_PERF") == "1", "Perf tests are opt-in.")

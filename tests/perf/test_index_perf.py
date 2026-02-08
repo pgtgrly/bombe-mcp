@@ -9,10 +9,7 @@ from pathlib import Path
 from bombe.indexer.pipeline import full_index
 from bombe.store.database import Database
 
-try:
-    from tests.perf.perf_utils import percentile, record_metrics
-except ModuleNotFoundError:
-    from perf_utils import percentile, record_metrics
+from tests.perf.perf_utils import percentile, record_metrics
 
 
 @unittest.skipUnless(os.getenv("BOMBE_RUN_PERF") == "1", "Perf tests are opt-in.")

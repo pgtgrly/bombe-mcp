@@ -45,6 +45,8 @@ The runtime is local-first and works without any control plane. Optional hybrid 
 - Incremental indexing support (git + non-git fallback) and perf trend tracking
 - Persistent parse/index diagnostics with per-run summaries
 - Include/exclude indexing filters plus `.bombeignore` support
+- Parallel extraction path with deterministic merge + throughput telemetry
+- Sensitive-path exclusion and context redaction safeguards
 - Release governance checks for latency and workflow quality gates
 
 ## Requirements
@@ -198,6 +200,7 @@ PYTHONPATH=src python3 -m bombe.server --repo /abs/repo --runtime-profile strict
 | `BOMBE_REAL_REPO_PATHS=/path/repo1,/path/repo2` | Optional real-repo perf/eval coverage |
 | `BOMBE_SEMANTIC_HINTS_FILE=/abs/semantic-hints.json` | Optional semantic receiver-type hints for call resolution |
 | `BOMBE_REQUIRE_TREE_SITTER=1` | Internal strict parser switch (normally set via `--runtime-profile strict`) |
+| `BOMBE_EXCLUDE_SENSITIVE=0` | Disables default sensitive-path exclusion (not recommended) |
 
 ## MCP Tools
 
@@ -214,6 +217,9 @@ Available tools:
 - `get_server_status`
 - `estimate_context_size`
 - `get_context_summary`
+- `get_entry_points`
+- `get_hot_paths`
+- `get_orphan_symbols`
 
 ### Input examples
 
@@ -281,6 +287,24 @@ Available tools:
 
 ```json
 {"query":"authenticate flow","entry_points":["app.auth.authenticate"],"token_budget":1200}
+```
+
+`get_entry_points`
+
+```json
+{"limit":20}
+```
+
+`get_hot_paths`
+
+```json
+{"limit":20}
+```
+
+`get_orphan_symbols`
+
+```json
+{"limit":50}
 ```
 
 All dict-returning tools also accept:

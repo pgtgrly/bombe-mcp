@@ -80,6 +80,9 @@ class MCPContractTests(unittest.TestCase):
                 "get_server_status",
                 "estimate_context_size",
                 "get_context_summary",
+                "get_entry_points",
+                "get_hot_paths",
+                "get_orphan_symbols",
             })
             self.assertIsNotNone(fake_server.registered["search_symbols"]["input_schema"])
 
@@ -105,6 +108,15 @@ class MCPContractTests(unittest.TestCase):
                         "match_reason",
                     },
                 )
+
+            paged_search_payload = registry["search_symbols"]["handler"](
+                {"query": "auth", "limit": 1, "offset": 1}
+            )
+            self.assertEqual(
+                set(paged_search_payload.keys()),
+                {"symbols", "total_matches", "pagination"},
+            )
+            self.assertEqual(int(paged_search_payload["pagination"]["offset"]), 1)
 
             references_payload = registry["get_references"]["handler"](
                 {"symbol_name": "authenticate", "direction": "callers", "depth": 1}
@@ -217,6 +229,8 @@ class MCPContractTests(unittest.TestCase):
                     "counts",
                     "indexing_diagnostics_summary",
                     "recent_indexing_diagnostics",
+                    "tool_metrics_summary",
+                    "planner_cache",
                     "recent_tool_metrics",
                 },
             )
@@ -264,6 +278,58 @@ class MCPContractTests(unittest.TestCase):
                 },
             )
 
+            entry_points_payload = registry["get_entry_points"]["handler"]({"limit": 10})
+            self.assertEqual(set(entry_points_payload.keys()), {"entry_points", "total_candidates"})
+            if entry_points_payload["entry_points"]:
+                self.assertEqual(
+                    set(entry_points_payload["entry_points"][0].keys()),
+                    {
+                        "name",
+                        "qualified_name",
+                        "kind",
+                        "file_path",
+                        "start_line",
+                        "end_line",
+                        "pagerank_score",
+                        "inbound_count",
+                        "outbound_count",
+                        "entry_score",
+                    },
+                )
+
+            hot_paths_payload = registry["get_hot_paths"]["handler"]({"limit": 10})
+            self.assertEqual(set(hot_paths_payload.keys()), {"hot_paths", "total_candidates"})
+            if hot_paths_payload["hot_paths"]:
+                self.assertEqual(
+                    set(hot_paths_payload["hot_paths"][0].keys()),
+                    {
+                        "name",
+                        "qualified_name",
+                        "kind",
+                        "file_path",
+                        "inbound_count",
+                        "outbound_count",
+                        "pagerank_score",
+                        "hot_score",
+                    },
+                )
+
+            orphan_payload = registry["get_orphan_symbols"]["handler"]({"limit": 10})
+            self.assertEqual(set(orphan_payload.keys()), {"orphan_symbols", "total_orphans"})
+            if orphan_payload["orphan_symbols"]:
+                self.assertEqual(
+                    set(orphan_payload["orphan_symbols"][0].keys()),
+                    {
+                        "name",
+                        "qualified_name",
+                        "kind",
+                        "file_path",
+                        "start_line",
+                        "end_line",
+                        "reason",
+                    },
+                )
+
             metric_rows = db.query(
                 """
                 SELECT tool_name, success
@@ -271,7 +337,7 @@ class MCPContractTests(unittest.TestCase):
                 ORDER BY id;
                 """
             )
-            self.assertGreaterEqual(len(metric_rows), 11)
+            self.assertGreaterEqual(len(metric_rows), 14)
             self.assertTrue(all(int(row["success"]) == 1 for row in metric_rows))
 
 

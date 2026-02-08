@@ -24,6 +24,19 @@ LANGUAGE_BY_EXTENSION = {
     ".go": "go",
 }
 
+DEFAULT_SENSITIVE_EXCLUDE_PATTERNS = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*secret*",
+    "*secrets*",
+    "*credential*",
+    "id_rsa",
+    "id_dsa",
+)
+
 
 def load_gitignore_rules(repo_root: Path) -> list[IgnoreRule]:
     return _load_ignore_file(repo_root / ".gitignore")
@@ -90,6 +103,11 @@ def iter_repo_files(
     exclude_patterns: list[str] | None = None,
 ) -> Iterator[Path]:
     rules = [*load_gitignore_rules(repo_root), *load_bombeignore_rules(repo_root)]
+    exclude_sensitive_env = os.getenv("BOMBE_EXCLUDE_SENSITIVE", "1").strip().lower()
+    exclude_sensitive = exclude_sensitive_env not in {"0", "false", "no", "off"}
+    if exclude_sensitive:
+        for pattern in DEFAULT_SENSITIVE_EXCLUDE_PATTERNS:
+            rules.append(_normalize_pattern(pattern))
     include = [pattern for pattern in (include_patterns or []) if pattern.strip()]
     for pattern in (exclude_patterns or []):
         stripped = pattern.strip()
