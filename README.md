@@ -1,41 +1,49 @@
 # Bombe
 
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Local-first](https://img.shields.io/badge/runtime-local--first-success)
+![MCP](https://img.shields.io/badge/protocol-MCP-informational)
+
 Bombe is a structure-aware code retrieval MCP server for AI coding agents.
-It builds a local graph index from source code, then serves graph-aware MCP tools for:
+It builds a local graph index from source code, then serves graph-aware tools for:
 
-- symbol discovery
-- caller/callee/reference traversal
-- data flow tracing
-- change impact estimation
-- token-budgeted context assembly
+- Symbol discovery
+- Caller/callee/reference traversal
+- Data-flow tracing
+- Change-impact estimation
+- Token-budgeted context assembly
 
-The runtime is local-first and works without a control plane. Hybrid sync modules are included for delta/artifact exchange when shared intelligence is desired.
+The runtime is local-first and works without any control plane. Optional hybrid sync modules are included for delta/artifact exchange when shared intelligence is needed.
 
-## Table of contents
+## Table of Contents
 
-- What Bombe provides
-- Requirements
-- Quick start
-- CLI and environment reference
-- Spec completion roadmap
-- Architecture
-- Indexing model
-- MCP tools and response contracts
-- Hybrid sync model
-- Performance and release gates
-- Repository layout
-- Runbooks
-- Development workflow
-- Troubleshooting and limitations
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Environment Variables](#environment-variables)
+- [MCP Tools](#mcp-tools)
+- [Architecture](#architecture)
+- [Indexing Model](#indexing-model)
+- [Hybrid Sync Model](#hybrid-sync-model)
+- [Performance and Release Gates](#performance-and-release-gates)
+- [Repository Layout](#repository-layout)
+- [Runbooks](#runbooks)
+- [Development Workflow](#development-workflow)
+- [Spec Roadmap](#spec-roadmap)
+- [Verification Snapshot](#verification-snapshot)
+- [Troubleshooting and Limitations](#troubleshooting-and-limitations)
+- [Status](#status)
 
-## What Bombe provides
+## Features
 
-- Local-first graph indexing with SQLite.
-- Multi-language symbol extraction (Python, TypeScript, Java, Go).
-- Call/import/type dependency edges for structural traversal.
-- Strict MCP tool schemas with contract tests.
-- Incremental indexing support and perf trend tracking.
-- Release-governance checks for latency and workflow quality gates.
+- Local-first graph indexing with SQLite
+- Multi-language symbol extraction (Python, TypeScript, Java, Go)
+- Call/import/type dependency edges for structural traversal
+- Strict MCP tool schemas with contract tests
+- Incremental indexing support and perf trend tracking
+- Release governance checks for latency and workflow quality gates
 
 ## Requirements
 
@@ -43,9 +51,9 @@ The runtime is local-first and works without a control plane. Hybrid sync module
 - A local checkout of the repository to index
 - Write access to the configured DB location
 
-## Quick start
+## Install
 
-Install:
+Install package:
 
 ```bash
 python3 -m pip install .
@@ -57,40 +65,56 @@ Developer install:
 python3 -m pip install ".[dev]"
 ```
 
+## Quick Start
+
 Initialize storage:
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo . --init-only --log-level INFO
 ```
 
-Start server (STDIO MCP runtime when `mcp` runtime package is available):
+Run a full index:
+
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo . index-full
+```
+
+Start server (STDIO MCP runtime when `mcp` is available):
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo . --log-level INFO
 ```
 
-## CLI and environment reference
+Check runtime health:
 
-### Global CLI arguments
+```bash
+PYTHONPATH=src python3 -m bombe.server --repo . doctor
+```
 
-- `--repo`: repository root to index (default: `.`)
-- `--db-path`: explicit SQLite path (default: `<repo>/.bombe/bombe.db`)
-- `--log-level`: `DEBUG|INFO|WARNING|ERROR` (default: `INFO`)
-- `--init-only`: initialize storage and exit
-- `--hybrid-sync`: enable post-index sync cycle (push/pull/reconcile)
-- `--control-plane-root`: file-backed control-plane root (default: `<repo>/.bombe/control-plane`)
-- `--sync-timeout-ms`: sync push/pull timeout budget in ms (default: `500`)
+## CLI Reference
+
+### Global arguments
+
+| Argument | Description | Default |
+|---|---|---|
+| `--repo` | Repository root to index | `.` |
+| `--db-path` | Explicit SQLite path | `<repo>/.bombe/bombe.db` |
+| `--log-level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
+| `--init-only` | Initialize storage and exit | `false` |
+| `--hybrid-sync` | Enable post-index sync cycle | `false` |
+| `--control-plane-root` | File-backed control-plane root | `<repo>/.bombe/control-plane` |
+| `--sync-timeout-ms` | Sync push/pull timeout budget | `500` |
 
 ### Subcommands
 
-- `serve`: start MCP server runtime.
-  - `--index-mode none|full|incremental`: optional pre-serve index action.
-- `index-full`: run full index and exit (prints JSON stats).
-- `index-incremental`: run incremental index from git diff and exit (prints JSON stats).
-- `watch`: poll git changes and run incremental indexing loop (prints JSON summary).
-- `status`: print index/sync status JSON and exit.
-- `doctor`: run health checks for schema/runtime/writability/tool registry (prints JSON report).
-  - `--fix`: apply safe auto-remediation for schema/queue/cache meta issues.
+| Command | Purpose | Key options |
+|---|---|---|
+| `serve` | Start MCP server runtime | `--index-mode none|full|incremental` |
+| `index-full` | Run full index and exit (JSON stats) | `--workers` |
+| `index-incremental` | Run incremental index from git diff (JSON stats) | `--workers` |
+| `watch` | Loop incremental indexing (JSON summary) | `--max-cycles`, `--poll-interval-ms`, `--watch-mode`, `--debounce-ms` |
+| `status` | Print index/sync status JSON and exit | - |
+| `doctor` | Run health checks (JSON report) | `--fix` |
 
 ### Command examples
 
@@ -118,13 +142,7 @@ Serve with incremental warmup:
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo --hybrid-sync serve --index-mode incremental
 ```
 
-Status:
-
-```bash
-PYTHONPATH=src python3 -m bombe.server --repo /abs/repo status
-```
-
-Watch mode (single cycle example):
+Watch mode (single cycle):
 
 ```bash
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --max-cycles 1 --poll-interval-ms 500
@@ -136,130 +154,25 @@ Watch mode with filesystem events when available:
 PYTHONPATH=src python3 -m bombe.server --repo /abs/repo watch --watch-mode fs --max-cycles 1
 ```
 
-Doctor:
+Doctor with safe auto-remediation:
 
 ```bash
-PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor
+PYTHONPATH=src python3 -m bombe.server --repo /abs/repo doctor --fix
 ```
 
-### Environment variables
+## Environment Variables
 
-- `BOMBE_RUN_PERF=1`: enables perf suites in `tests/perf`
-- `BOMBE_PERF_HISTORY=/absolute/path/file.jsonl`: metrics history output for perf suites and release gate evaluation
-- `BOMBE_SYNC_SIGNING_KEY=your-shared-secret`: enables HMAC signing/verification for hybrid artifacts
-- `BOMBE_SYNC_SIGNING_ALGO=hmac-sha256|ed25519`: selects artifact signature algorithm (`ed25519` requires `cryptography`)
-- `BOMBE_SYNC_KEY_ID=key-identifier`: sets artifact signing key identifier
-- `BOMBE_REAL_REPO_PATHS=/path/to/repo1,/path/to/repo2`: enables optional real-repo perf/eval test coverage
-- `BOMBE_SEMANTIC_HINTS_FILE=/abs/semantic-hints.json`: optional semantic receiver type hints for call resolution
+| Variable | Description |
+|---|---|
+| `BOMBE_RUN_PERF=1` | Enables perf suites in `tests/perf` |
+| `BOMBE_PERF_HISTORY=/abs/path/file.jsonl` | Metrics history output for perf suites and release gates |
+| `BOMBE_SYNC_SIGNING_KEY=...` | Enables hybrid artifact signing/verification |
+| `BOMBE_SYNC_SIGNING_ALGO=hmac-sha256\|ed25519` | Signature algorithm (`ed25519` requires `cryptography`) |
+| `BOMBE_SYNC_KEY_ID=...` | Artifact signing key identifier |
+| `BOMBE_REAL_REPO_PATHS=/path/repo1,/path/repo2` | Optional real-repo perf/eval coverage |
+| `BOMBE_SEMANTIC_HINTS_FILE=/abs/semantic-hints.json` | Optional semantic receiver-type hints for call resolution |
 
-## Spec completion roadmap
-
-The implementation is tracked as nine execution phases so agents can audit progress against spec outcomes:
-
-1. Contract and identity foundation.
-2. Local call-resolution precision.
-3. Collision-safe symbol/edge identity mapping.
-4. Migration framework and persisted state.
-5. Query guardrails and quality metrics.
-6. Hybrid sync protocol and reconciliation.
-7. Server lifecycle commands and operational status.
-8. Workflow benchmark gates and release gate integration.
-9. Observability, runbooks, and operator readiness.
-
-Detailed execution plan:
-
-- `docs/plans/2026-02-08-spec-completion-9-phase-execution-plan.md`
-
-## Architecture
-
-Bombe is split into local runtime modules and optional hybrid modules.
-
-### Local runtime
-
-- File scanning and language detection
-- Parser + symbol extraction + call/import resolution
-- Optional semantic receiver-type hints merged into call resolution
-- SQLite graph storage:
-  - `files`
-  - `symbols`
-  - `edges`
-  - `external_deps`
-  - FTS virtual table (`symbol_fts`)
-- Query engines:
-  - search
-  - references
-  - context assembly
-  - blast radius
-  - data flow
-  - change impact
-- MCP tool registration and handler wiring
-- Query planner cache layer for repeated payloads
-- Tokenizer abstraction with optional model-aware token counting (`tiktoken` if installed)
-
-### Hybrid modules
-
-- `src/bombe/sync/client.py`:
-  - compatibility checks
-  - async push/pull
-  - timeout budgets
-  - circuit breaker
-  - checksum validation
-  - optional HMAC artifact signature verification
-  - quarantine
-- `src/bombe/sync/reconcile.py`:
-  - promotion policy gates
-  - touched-scope merge precedence
-- `src/bombe/sync/transport.py`:
-  - file-backed control-plane transport for local hybrid deployments
-- `src/bombe/sync/orchestrator.py`:
-  - delta construction from local graph state
-  - persisted sync queue status updates
-  - pull + reconcile + artifact pin flow
-
-### Release governance
-
-- `src/bombe/release/gates.py` evaluates recorded suite metrics against hard thresholds and returns pass/fail.
-
-### Observability and persisted state
-
-SQLite schema version `5` includes state for operations and diagnostics:
-
-- `sync_queue`
-- `artifact_quarantine`
-- `artifact_pins`
-- `circuit_breakers`
-- `sync_events`
-- `tool_metrics`
-- `migration_history`
-- `trusted_signing_keys`
-- repo metadata key `cache_epoch` for query cache invalidation
-
-## Indexing model
-
-High-level pipeline:
-
-1. Walk repository files and detect supported languages.
-2. Parse files and extract symbols/imports.
-3. Resolve imports and call edges.
-4. Persist symbols/edges/dependencies into SQLite.
-5. Recompute rank features used by query layers.
-
-Incremental path updates only changed files and then rebuilds impacted graph state.
-
-## Guardrails and safety limits
-
-Runtime payload guardrails are enforced for depth, limits, and query lengths:
-
-- search limit clamped to max `100`
-- graph depth clamped to max `6`
-- context token budget clamped to max `32000`
-- entry points capped at `32`
-- traversal node/edge caps prevent runaway expansion
-- adaptive traversal caps scale by repository symbol count for large-repo memory safety
-
-These limits are defined in `src/bombe/query/guards.py`.
-
-## MCP tools and response contracts
+## MCP Tools
 
 Available tools:
 
@@ -321,7 +234,7 @@ All dict-returning tools also accept:
 {"include_explanations":true}
 ```
 
-When enabled, responses include an `explanations` section with reasoning metadata. `get_structure` remains a string response and prepends a structured explanation header line.
+When enabled, responses include an `explanations` section with reasoning metadata.
 
 All tools also accept:
 
@@ -337,16 +250,103 @@ Strict contract behavior is verified by:
 
 - `tests/test_mcp_contract.py`
 
-The tests assert key sets and payload shapes for all tool responses.
+## Architecture
 
-## Hybrid sync model
+Bombe is split into local runtime modules and optional hybrid modules.
+
+### Local runtime
+
+- File scanning and language detection
+- Parser plus symbol extraction plus call/import resolution
+- Optional semantic receiver-type hints merged into call resolution
+- SQLite graph storage
+  - `files`
+  - `symbols`
+  - `edges`
+  - `external_deps`
+  - FTS virtual table `symbol_fts`
+- Query engines
+  - search
+  - references
+  - context assembly
+  - blast radius
+  - data flow
+  - change impact
+- MCP tool registration and handler wiring
+- Query planner cache layer for repeated payloads
+- Tokenizer abstraction with optional model-aware token counting (`tiktoken` if installed)
+
+### Hybrid modules
+
+- `src/bombe/sync/client.py`
+  - compatibility checks
+  - async push/pull
+  - timeout budgets
+  - circuit breaker
+  - checksum validation
+  - optional artifact signature verification
+  - quarantine
+- `src/bombe/sync/reconcile.py`
+  - promotion policy gates
+  - touched-scope merge precedence
+- `src/bombe/sync/transport.py`
+  - file-backed control-plane transport for local hybrid deployments
+- `src/bombe/sync/orchestrator.py`
+  - delta construction from local graph state
+  - persisted sync queue status updates
+  - pull plus reconcile plus artifact pin flow
+
+### Release governance
+
+`src/bombe/release/gates.py` evaluates recorded suite metrics against hard thresholds and returns pass/fail.
+
+### Observability and persisted state
+
+SQLite schema version `5` includes state for operations and diagnostics:
+
+- `sync_queue`
+- `artifact_quarantine`
+- `artifact_pins`
+- `circuit_breakers`
+- `sync_events`
+- `tool_metrics`
+- `migration_history`
+- `trusted_signing_keys`
+- Repo metadata key `cache_epoch` for query cache invalidation
+
+## Indexing Model
+
+High-level pipeline:
+
+1. Walk repository files and detect supported languages.
+2. Parse files and extract symbols/imports.
+3. Resolve imports and call edges.
+4. Persist symbols/edges/dependencies into SQLite.
+5. Recompute rank features used by query layers.
+
+Incremental path updates only changed files, then rebuild impacted graph state.
+
+### Guardrails and safety limits
+
+Runtime payload guardrails are enforced for depth, limits, and query lengths:
+
+- Search limit clamped to max `100`
+- Graph depth clamped to max `6`
+- Context token budget clamped to max `32000`
+- Entry points capped at `32`
+- Traversal node/edge caps prevent runaway expansion
+- Adaptive traversal caps scale by repository symbol count for large-repo memory safety
+
+These limits are defined in `src/bombe/query/guards.py`.
+
+## Hybrid Sync Model
 
 Hybrid sync is additive and does not replace local query serving.
 
 - Local path remains authoritative and available.
 - Incompatible artifacts are rejected.
 - Corrupt artifacts are quarantined.
-- Signature mismatches are quarantined when `BOMBE_SYNC_SIGNING_KEY` is configured.
+- Signature mismatches are quarantined when signing is configured.
 - Trusted key policy can be persisted per repository in `trusted_signing_keys` for verification key selection.
 - Repeated remote failures open the circuit breaker.
 - Results explicitly expose fallback mode (`local_fallback`) when remote operations are skipped or fail.
@@ -354,7 +354,7 @@ Hybrid sync is additive and does not replace local query serving.
 
 ### Backup and restore
 
-Database backup/restore helpers are available in `Database`:
+Database backup/restore helpers are available on `Database`:
 
 ```python
 from pathlib import Path
@@ -365,7 +365,7 @@ backup_path = db.backup_to(Path("/tmp/bombe-backup.db"))
 db.restore_from(backup_path)
 ```
 
-## Performance and release gates
+## Performance and Release Gates
 
 Run perf suites:
 
@@ -395,7 +395,7 @@ Current gate families:
 
 Thresholds are defined in `src/bombe/release/gates.py`.
 
-## Repository layout
+## Repository Layout
 
 - `src/bombe/indexer`: scanning, parsing, extraction, imports, callgraph, ranking, pipeline
 - `src/bombe/query`: tool backends
@@ -415,7 +415,7 @@ Thresholds are defined in `src/bombe/release/gates.py`.
 - `docs/runbooks/hybrid-mode.md`
 - `docs/runbooks/rollback-and-quarantine.md`
 
-## Development workflow
+## Development Workflow
 
 Compile:
 
@@ -437,9 +437,9 @@ PYTHONPATH=src python3 -m bombe.server --repo . --init-only --log-level INFO
 
 CI jobs in `.github/workflows/ci.yml`:
 
-- lint/typecheck
-- unit + coverage
-- release-gates (perf + gate evaluation)
+- `lint-and-typecheck`
+- `test`
+- `release-gates`
 
 Recommended local all-check run:
 
@@ -450,7 +450,25 @@ BOMBE_RUN_PERF=1 PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "t
 PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.jsonl
 ```
 
-## Verification snapshot
+## Spec Roadmap
+
+Implementation is tracked as nine execution phases so agents can audit progress against spec outcomes:
+
+1. Contract and identity foundation
+2. Local call-resolution precision
+3. Collision-safe symbol/edge identity mapping
+4. Migration framework and persisted state
+5. Query guardrails and quality metrics
+6. Hybrid sync protocol and reconciliation
+7. Server lifecycle commands and operational status
+8. Workflow benchmark gates and release gate integration
+9. Observability, runbooks, and operator readiness
+
+Detailed execution plan:
+
+- `docs/plans/2026-02-08-spec-completion-9-phase-execution-plan.md`
+
+## Verification Snapshot
 
 Latest local verification run (2026-02-08):
 
@@ -459,26 +477,26 @@ Latest local verification run (2026-02-08):
 - `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`6` tests, `1` skipped when `BOMBE_REAL_REPO_PATHS` is unset)
 - `PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.final.jsonl` -> `RELEASE_GATES=PASS`
 
-## Troubleshooting and limitations
+## Troubleshooting and Limitations
 
-Troubleshooting:
+### Troubleshooting
 
-- Parse/extraction misses:
-  - verify file extension and syntax
-  - confirm file is under indexed repo path
-- Empty query output:
-  - verify indexing completed and symbols exist in DB
-- Gate failure:
-  - inspect perf history JSONL
-  - rerun only failing suite
-  - evaluate again with `bombe.release.gates`
+- Parse/extraction misses
+  - Verify file extension and syntax
+  - Confirm file is under indexed repo path
+- Empty query output
+  - Verify indexing completed and symbols exist in DB
+- Gate failure
+  - Inspect perf history JSONL
+  - Rerun only the failing suite
+  - Evaluate again with `bombe.release.gates`
 
-Known limitations:
+### Known limitations
 
 - Static call resolution can miss dynamic dispatch and reflection-heavy patterns.
-- Precision/recall in extremely dynamic codebases depends on language semantics available to static analysis.
-- Hybrid sync primitives are implemented, but deployment topology for shared control plane is intentionally left operator-specific.
+- Precision/recall in highly dynamic codebases depends on semantic signal quality.
+- Hybrid sync primitives are implemented, but deployment topology for shared control plane remains operator-specific.
 
 ## Status
 
-Active implementation toward hybrid, spec-complete MCP traversal/runtime with hard release gates and operator runbooks.
+Active implementation toward a hybrid, spec-complete MCP traversal/runtime with hard release gates and operator runbooks.
