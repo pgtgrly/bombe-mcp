@@ -8,6 +8,9 @@ import os
 from dataclasses import replace
 from dataclasses import asdict
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from bombe.models import ArtifactBundle, EdgeContractRecord, IndexDelta, SymbolKey
 from bombe.sync.client import build_artifact_checksum, build_artifact_signature
@@ -180,3 +183,77 @@ class FileControlPlaneTransport:
         if not isinstance(payload, dict):
             return None
         return _artifact_from_dict(payload)
+
+
+class HttpControlPlaneTransport:
+    def __init__(
+        self,
+        base_url: str,
+        auth_token: str | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.auth_token = auth_token or os.getenv("BOMBE_CONTROL_PLANE_TOKEN")
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> tuple[int, dict[str, object] | None]:
+        url = f"{self.base_url}{path}"
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        if payload is not None:
+            data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        request = Request(url=url, data=data, method=method, headers=headers)
+        try:
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+                if not body.strip():
+                    return response.status, None
+                parsed = json.loads(body)
+                return response.status, parsed if isinstance(parsed, dict) else None
+        except HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8")
+                parsed = json.loads(body)
+                return int(exc.code), parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return int(exc.code), None
+        except URLError:
+            return 503, None
+
+    def push_delta(self, delta: IndexDelta) -> bool | dict[str, object]:
+        status, payload = self._request_json(
+            "POST",
+            "/v1/deltas",
+            payload={"delta": asdict(delta)},
+        )
+        if status >= 400:
+            return {"accepted": False, "error_status": status}
+        if payload is None:
+            return {"accepted": True}
+        return payload
+
+    def pull_latest_artifact(
+        self,
+        repo_id: str,
+        snapshot_id: str,
+        parent_snapshot: str | None,
+    ) -> ArtifactBundle | None:
+        params = {
+            "repo_id": repo_id,
+            "snapshot_id": snapshot_id,
+        }
+        if parent_snapshot:
+            params["parent_snapshot"] = parent_snapshot
+        query = urlencode(params)
+        status, payload = self._request_json("GET", f"/v1/artifacts/latest?{query}", payload=None)
+        if status == 404 or payload is None:
+            return None
+        artifact_raw = payload.get("artifact")
+        if not isinstance(artifact_raw, dict):
+            return None
+        return _artifact_from_dict(artifact_raw)

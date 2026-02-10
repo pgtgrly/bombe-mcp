@@ -18,10 +18,19 @@ from bombe.indexer.pipeline import full_index, incremental_index
 from bombe.indexer.semantic import backend_statuses
 from bombe.models import FileChange
 from bombe.sync.orchestrator import run_sync_cycle
-from bombe.sync.transport import FileControlPlaneTransport
+from bombe.sync.transport import FileControlPlaneTransport, HttpControlPlaneTransport
 from bombe.watcher.git_diff import get_changed_files
 from bombe.store.database import Database, SCHEMA_VERSION
+from bombe.plugins import PluginManager
 from bombe.tools.definitions import build_tool_registry, register_tools
+from bombe.ui_api import build_inspector_bundle
+from bombe.workspace import (
+    build_workspace_config,
+    default_workspace_file,
+    enabled_workspace_roots,
+    load_workspace_config,
+    save_workspace_config,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Root directory for file-based control-plane transport.",
+    )
+    parser.add_argument(
+        "--control-plane-url",
+        type=str,
+        default=None,
+        help="Optional reference control-plane HTTP base URL.",
     )
     parser.add_argument(
         "--sync-timeout-ms",
@@ -148,6 +163,81 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Maximum number of changed files processed per watch cycle.",
+    )
+
+    workspace_init_parser = subparsers.add_parser(
+        "workspace-init",
+        help="Create or overwrite workspace root configuration.",
+    )
+    workspace_init_parser.add_argument(
+        "--workspace-file",
+        type=Path,
+        default=None,
+        help="Workspace config path. Defaults to <repo>/.bombe/workspace.json.",
+    )
+    workspace_init_parser.add_argument(
+        "--name",
+        type=str,
+        default="workspace",
+        help="Workspace name.",
+    )
+    workspace_init_parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Workspace root path. Repeat for multiple roots.",
+    )
+
+    workspace_status_parser = subparsers.add_parser(
+        "workspace-status",
+        help="Print aggregated status for all workspace roots.",
+    )
+    workspace_status_parser.add_argument(
+        "--workspace-file",
+        type=Path,
+        default=None,
+        help="Workspace config path. Defaults to <repo>/.bombe/workspace.json.",
+    )
+    workspace_status_parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="Include disabled roots in status output.",
+    )
+
+    workspace_index_parser = subparsers.add_parser(
+        "workspace-index-full",
+        help="Run full indexing for all enabled workspace roots.",
+    )
+    workspace_index_parser.add_argument(
+        "--workspace-file",
+        type=Path,
+        default=None,
+        help="Workspace config path. Defaults to <repo>/.bombe/workspace.json.",
+    )
+    workspace_index_parser.add_argument("--workers", type=int, default=4, help="Worker count hint.")
+    workspace_index_parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="Include disabled roots in indexing output (still skipped for index execution).",
+    )
+
+    inspect_parser = subparsers.add_parser(
+        "inspect-export",
+        help="Export a read-only inspector bundle for the UI.",
+    )
+    inspect_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("ui") / "bundle.json",
+        help="Output path for inspector JSON bundle.",
+    )
+    inspect_parser.add_argument("--node-limit", type=int, default=300, help="Maximum symbols to export.")
+    inspect_parser.add_argument("--edge-limit", type=int, default=500, help="Maximum edges to export.")
+    inspect_parser.add_argument(
+        "--diagnostics-limit",
+        type=int,
+        default=50,
+        help="Maximum diagnostics rows to export.",
     )
 
     subparsers.add_parser("status", help="Print local index status and exit.")
@@ -260,17 +350,36 @@ def _run_full_index(
     db: Database,
     workers: int,
     args: argparse.Namespace | None = None,
+    plugin_manager: PluginManager | None = None,
 ) -> dict[str, Any]:
     include_patterns = _pattern_list(getattr(args, "include", [])) if args is not None else []
     exclude_patterns = _pattern_list(getattr(args, "exclude", [])) if args is not None else []
+    effective_workers = max(1, workers)
+    if plugin_manager is not None:
+        plugin_payload = plugin_manager.before_index(
+            "full",
+            {
+                "repo_root": repo_root.as_posix(),
+                "workers": effective_workers,
+                "include_patterns": include_patterns,
+                "exclude_patterns": exclude_patterns,
+            },
+        )
+        if isinstance(plugin_payload, dict):
+            try:
+                effective_workers = max(1, int(plugin_payload.get("workers", effective_workers)))
+            except (TypeError, ValueError):
+                effective_workers = max(1, workers)
     stats = full_index(
         repo_root,
         db,
-        workers=max(1, workers),
+        workers=effective_workers,
         include_patterns=include_patterns,
         exclude_patterns=exclude_patterns,
     )
     payload = _stats_to_payload(stats, mode="full")
+    if plugin_manager is not None:
+        plugin_manager.after_index("full", payload, error=None)
     logging.getLogger(__name__).info(
         "Full index complete: files_indexed=%d symbols=%d edges=%d elapsed_ms=%d",
         payload["files_indexed"],
@@ -287,6 +396,7 @@ def _run_incremental_index(
     workers: int,
     changes: list[FileChange] | None = None,
     args: argparse.Namespace | None = None,
+    plugin_manager: PluginManager | None = None,
 ) -> dict[str, Any]:
     include_patterns = _pattern_list(getattr(args, "include", [])) if args is not None else []
     exclude_patterns = _pattern_list(getattr(args, "exclude", [])) if args is not None else []
@@ -309,8 +419,30 @@ def _run_incremental_index(
                 sort_keys=True,
             ),
         )
-    stats = incremental_index(repo_root, db, resolved_changes, workers=max(1, workers))
+    effective_workers = max(1, workers)
+    if plugin_manager is not None:
+        plugin_payload = plugin_manager.before_index(
+            "incremental",
+            {
+                "repo_root": repo_root.as_posix(),
+                "workers": effective_workers,
+                "changes": [
+                    {"status": change.status, "path": change.path, "old_path": change.old_path}
+                    for change in resolved_changes
+                ],
+                "include_patterns": include_patterns,
+                "exclude_patterns": exclude_patterns,
+            },
+        )
+        if isinstance(plugin_payload, dict):
+            try:
+                effective_workers = max(1, int(plugin_payload.get("workers", effective_workers)))
+            except (TypeError, ValueError):
+                effective_workers = max(1, workers)
+    stats = incremental_index(repo_root, db, resolved_changes, workers=effective_workers)
     payload = _stats_to_payload(stats, mode="incremental", changed_files=resolved_changes)
+    if plugin_manager is not None:
+        plugin_manager.after_index("incremental", payload, error=None)
     logging.getLogger(__name__).info(
         "Incremental index complete: changed=%d files_indexed=%d symbols=%d edges=%d elapsed_ms=%d",
         len(resolved_changes),
@@ -337,9 +469,15 @@ def _run_hybrid_sync(
         return None
     timeout_ms = max(1, int(getattr(args, "sync_timeout_ms", 500)))
     control_plane_root = getattr(args, "control_plane_root", None)
-    if control_plane_root is None:
-        control_plane_root = repo_root / ".bombe" / "control-plane"
-    transport = FileControlPlaneTransport(Path(control_plane_root))
+    control_plane_url = getattr(args, "control_plane_url", None)
+    if isinstance(control_plane_url, str) and control_plane_url.strip():
+        transport = HttpControlPlaneTransport(control_plane_url.strip())
+        control_plane_descriptor = control_plane_url.strip()
+    else:
+        if control_plane_root is None:
+            control_plane_root = repo_root / ".bombe" / "control-plane"
+        transport = FileControlPlaneTransport(Path(control_plane_root))
+        control_plane_descriptor = Path(control_plane_root).expanduser().resolve().as_posix()
     report = run_sync_cycle(
         repo_root=repo_root,
         db=db,
@@ -355,7 +493,7 @@ def _run_hybrid_sync(
         "push": report.push,
         "pull": report.pull,
         "pinned_artifact_id": report.pinned_artifact_id,
-        "control_plane_root": Path(control_plane_root).expanduser().resolve().as_posix(),
+        "control_plane": control_plane_descriptor,
     }
     logging.getLogger(__name__).info(
         "Hybrid sync complete: queue_id=%d push=%s pull=%s pinned=%s",
@@ -365,6 +503,138 @@ def _run_hybrid_sync(
         report.pinned_artifact_id,
     )
     return payload
+
+
+def _resolve_workspace_file(repo_root: Path, workspace_file: Path | None) -> Path:
+    if workspace_file is None:
+        return default_workspace_file(repo_root)
+    if workspace_file.is_absolute():
+        return workspace_file.expanduser().resolve()
+    return (repo_root / workspace_file).expanduser().resolve()
+
+
+def _workspace_status_payload(
+    repo_root: Path,
+    workspace_file: Path,
+    diagnostics_limit: int,
+    include_disabled: bool = False,
+) -> dict[str, Any]:
+    config = load_workspace_config(repo_root, workspace_file=workspace_file)
+    root_entries = config.roots if include_disabled else enabled_workspace_roots(config)
+    results: list[dict[str, Any]] = []
+    totals = {"roots": 0, "files": 0, "symbols": 0, "edges": 0, "diagnostics_errors": 0}
+    for root in root_entries:
+        root_path = Path(root.path)
+        db_path = Path(root.db_path)
+        entry: dict[str, Any] = {
+            "root_id": root.id,
+            "root_path": root.path,
+            "db_path": root.db_path,
+            "enabled": bool(root.enabled),
+        }
+        if not root_path.exists() or not root_path.is_dir():
+            entry["status"] = "missing_root"
+            results.append(entry)
+            continue
+        try:
+            db = Database(db_path)
+            db.init_schema()
+            status_payload = _status_payload(db, root_path, diagnostics_limit=diagnostics_limit)
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            results.append(entry)
+            continue
+        entry["status"] = "ok"
+        entry["counts"] = status_payload.get("counts", {})
+        entry["indexing_diagnostics_summary"] = status_payload.get("indexing_diagnostics_summary", {})
+        results.append(entry)
+        counts = status_payload.get("counts", {})
+        totals["roots"] += 1
+        totals["files"] += int(counts.get("files", 0))
+        totals["symbols"] += int(counts.get("symbols", 0))
+        totals["edges"] += int(counts.get("edges", 0))
+        totals["diagnostics_errors"] += int(counts.get("indexing_diagnostics_errors", 0))
+    return {
+        "workspace_file": workspace_file.as_posix(),
+        "workspace_name": config.name,
+        "workspace_version": int(config.version),
+        "root_count": len(root_entries),
+        "totals": totals,
+        "roots": results,
+    }
+
+
+def _run_workspace_full_index(
+    repo_root: Path,
+    workspace_file: Path,
+    workers: int,
+    args: argparse.Namespace,
+    include_disabled: bool = False,
+    plugin_manager: PluginManager | None = None,
+) -> dict[str, Any]:
+    config = load_workspace_config(repo_root, workspace_file=workspace_file)
+    root_entries = config.roots if include_disabled else enabled_workspace_roots(config)
+    runs: list[dict[str, Any]] = []
+    totals = {
+        "roots_indexed": 0,
+        "roots_skipped": 0,
+        "files_indexed": 0,
+        "symbols_indexed": 0,
+        "edges_indexed": 0,
+        "elapsed_ms": 0,
+    }
+    for root in root_entries:
+        root_path = Path(root.path)
+        entry: dict[str, Any] = {
+            "root_id": root.id,
+            "root_path": root.path,
+            "db_path": root.db_path,
+            "enabled": bool(root.enabled),
+        }
+        if not bool(root.enabled):
+            entry["status"] = "skipped_disabled"
+            totals["roots_skipped"] += 1
+            runs.append(entry)
+            continue
+        if not root_path.exists() or not root_path.is_dir():
+            entry["status"] = "missing_root"
+            totals["roots_skipped"] += 1
+            runs.append(entry)
+            continue
+        started = time.perf_counter()
+        try:
+            root_db = Database(Path(root.db_path))
+            root_db.init_schema()
+            index_payload = _run_full_index(
+                repo_root=root_path,
+                db=root_db,
+                workers=workers,
+                args=args,
+                plugin_manager=plugin_manager,
+            )
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            totals["roots_skipped"] += 1
+            runs.append(entry)
+            continue
+        entry["status"] = "indexed"
+        entry["index"] = index_payload
+        entry["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+        runs.append(entry)
+        totals["roots_indexed"] += 1
+        totals["files_indexed"] += int(index_payload.get("files_indexed", 0))
+        totals["symbols_indexed"] += int(index_payload.get("symbols_indexed", 0))
+        totals["edges_indexed"] += int(index_payload.get("edges_indexed", 0))
+        totals["elapsed_ms"] += int(entry["elapsed_ms"])
+    return {
+        "workspace_file": workspace_file.as_posix(),
+        "workspace_name": config.name,
+        "workspace_version": int(config.version),
+        "roots": runs,
+        "totals": totals,
+    }
 
 
 def _tool_metrics_summary(db: Database, limit: int = 200) -> dict[str, Any]:
@@ -404,7 +674,12 @@ def _tool_metrics_summary(db: Database, limit: int = 200) -> dict[str, Any]:
     }
 
 
-def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) -> dict[str, Any]:
+def _status_payload(
+    db: Database,
+    repo_root: Path,
+    diagnostics_limit: int = 50,
+    plugin_manager: PluginManager | None = None,
+) -> dict[str, Any]:
     schema_row = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
     schema_version = int(schema_row[0]["value"]) if schema_row else 0
     file_rows = db.query("SELECT COUNT(*) AS count FROM files;")
@@ -454,6 +729,7 @@ def _status_payload(db: Database, repo_root: Path, diagnostics_limit: int = 50) 
         "indexing_diagnostics_summary": diagnostics_summary,
         "recent_indexing_diagnostics": recent_diagnostics,
         "tool_metrics_summary": tool_metrics_summary,
+        "plugin_manager": plugin_manager.stats() if plugin_manager is not None else {"plugins_loaded": 0},
         "recent_tool_metrics": db.query(
             """
             SELECT tool_name, latency_ms, success, mode, result_size, error_message, created_at
@@ -518,18 +794,29 @@ def _preflight_payload(repo_root: Path, db_path: Path, args: argparse.Namespace)
     if not db_writable:
         error_codes.append("db_directory_unwritable")
 
-    control_plane_root = getattr(args, "control_plane_root", None)
-    if control_plane_root is None:
-        control_plane_root = repo_root / ".bombe" / "control-plane"
-    control_plane_writable = _is_path_writable(Path(control_plane_root))
-    checks.append(
-        {
-            "code": "control_plane_unwritable",
-            "name": "control_plane_writable",
-            "status": "ok" if control_plane_writable else "degraded",
-            "detail": {"path": Path(control_plane_root).as_posix()},
-        }
-    )
+    control_plane_url = getattr(args, "control_plane_url", None)
+    if isinstance(control_plane_url, str) and control_plane_url.strip():
+        checks.append(
+            {
+                "code": "control_plane_http_configured",
+                "name": "control_plane_http",
+                "status": "ok",
+                "detail": {"url": control_plane_url.strip()},
+            }
+        )
+    else:
+        control_plane_root = getattr(args, "control_plane_root", None)
+        if control_plane_root is None:
+            control_plane_root = repo_root / ".bombe" / "control-plane"
+        control_plane_writable = _is_path_writable(Path(control_plane_root))
+        checks.append(
+            {
+                "code": "control_plane_unwritable",
+                "name": "control_plane_writable",
+                "status": "ok" if control_plane_writable else "degraded",
+                "detail": {"path": Path(control_plane_root).as_posix()},
+            }
+        )
 
     try:
         from mcp.server.fastmcp import FastMCP  # type: ignore
@@ -597,7 +884,12 @@ def _preflight_payload(repo_root: Path, db_path: Path, args: argparse.Namespace)
     }
 
 
-def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def _doctor_payload(
+    db: Database,
+    repo_root: Path,
+    args: argparse.Namespace,
+    plugin_manager: PluginManager | None = None,
+) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     fixes_applied: list[dict[str, Any]] = []
     runtime_profile = str(getattr(args, "runtime_profile", "default"))
@@ -640,17 +932,27 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
         }
     )
 
-    control_plane_root = getattr(args, "control_plane_root", None)
-    if control_plane_root is None:
-        control_plane_root = repo_root / ".bombe" / "control-plane"
-    control_plane_writable = _is_path_writable(Path(control_plane_root))
-    checks.append(
-        {
-            "name": "control_plane_writable",
-            "status": "ok" if control_plane_writable else "degraded",
-            "detail": {"path": Path(control_plane_root).as_posix()},
-        }
-    )
+    control_plane_url = getattr(args, "control_plane_url", None)
+    if isinstance(control_plane_url, str) and control_plane_url.strip():
+        checks.append(
+            {
+                "name": "control_plane_http",
+                "status": "ok",
+                "detail": {"url": control_plane_url.strip()},
+            }
+        )
+    else:
+        control_plane_root = getattr(args, "control_plane_root", None)
+        if control_plane_root is None:
+            control_plane_root = repo_root / ".bombe" / "control-plane"
+        control_plane_writable = _is_path_writable(Path(control_plane_root))
+        checks.append(
+            {
+                "name": "control_plane_writable",
+                "status": "ok" if control_plane_writable else "degraded",
+                "detail": {"path": Path(control_plane_root).as_posix()},
+            }
+        )
 
     try:
         from mcp.server.fastmcp import FastMCP  # type: ignore
@@ -672,12 +974,19 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
             }
         )
 
-    tool_registry = build_tool_registry(db, repo_root.as_posix())
+    tool_registry = build_tool_registry(db, repo_root.as_posix(), plugin_manager=plugin_manager)
     checks.append(
         {
             "name": "tool_registry",
-            "status": "ok" if len(tool_registry) >= 14 else "degraded",
+            "status": "ok" if len(tool_registry) >= 16 else "degraded",
             "detail": {"tool_count": len(tool_registry)},
+        }
+    )
+    checks.append(
+        {
+            "name": "plugins",
+            "status": "ok",
+            "detail": plugin_manager.stats() if plugin_manager is not None else {"plugins_loaded": 0},
         }
     )
 
@@ -687,6 +996,31 @@ def _doctor_payload(db: Database, repo_root: Path, args: argparse.Namespace) -> 
             "name": "semantic_backends",
             "status": "ok" if any(bool(item.get("available")) for item in semantic_status) else "degraded",
             "detail": {"backends": semantic_status},
+        }
+    )
+    lsp_enabled = os.getenv("BOMBE_ENABLE_LSP_HINTS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    lsp_available = any(bool(item.get("lsp_bridge_available", False)) for item in semantic_status)
+    checks.append(
+        {
+            "name": "lsp_bridge",
+            "status": "ok" if (not lsp_enabled or lsp_available) else "degraded",
+            "detail": {
+                "enabled": lsp_enabled,
+                "available": lsp_available,
+                "providers": [
+                    {
+                        "backend": str(item.get("backend")),
+                        "available": bool(item.get("lsp_bridge_available", False)),
+                        "executable": item.get("executable"),
+                    }
+                    for item in semantic_status
+                ],
+            },
         }
     )
 
@@ -844,6 +1178,7 @@ def _run_watch(
     repo_root: Path,
     db: Database,
     args: argparse.Namespace,
+    plugin_manager: PluginManager | None = None,
 ) -> dict[str, Any]:
     poll_interval_ms = max(100, int(getattr(args, "poll_interval_ms", 1000)))
     max_cycles = max(0, int(getattr(args, "max_cycles", 0)))
@@ -909,6 +1244,7 @@ def _run_watch(
                 workers=workers,
                 changes=changes,
                 args=args,
+                plugin_manager=plugin_manager,
             )
             runs += 1
             files_indexed_total += int(last_index_payload.get("files_indexed", 0))
@@ -971,6 +1307,75 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+    if command == "workspace-init":
+        workspace_file = _resolve_workspace_file(
+            settings.repo_root,
+            getattr(args, "workspace_file", None),
+        )
+        root_args = list(getattr(args, "root", []))
+        roots = [
+            (Path(item) if Path(item).is_absolute() else settings.repo_root / item)
+            for item in root_args
+        ] if root_args else [settings.repo_root]
+        config = build_workspace_config(
+            repo_root=settings.repo_root,
+            roots=roots,
+            name=str(getattr(args, "name", "workspace")),
+        )
+        saved = save_workspace_config(
+            settings.repo_root,
+            config=config,
+            workspace_file=workspace_file,
+        )
+        payload = {
+            "workspace_file": saved.as_posix(),
+            "workspace_name": config.name,
+            "workspace_version": int(config.version),
+            "roots": [
+                {
+                    "id": root.id,
+                    "path": root.path,
+                    "db_path": root.db_path,
+                    "enabled": bool(root.enabled),
+                }
+                for root in config.roots
+            ],
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "workspace-status":
+        workspace_file = _resolve_workspace_file(
+            settings.repo_root,
+            getattr(args, "workspace_file", None),
+        )
+        payload = _workspace_status_payload(
+            settings.repo_root,
+            workspace_file=workspace_file,
+            diagnostics_limit=max(1, int(getattr(args, "diagnostics_limit", 50))),
+            include_disabled=bool(getattr(args, "include_disabled", False)),
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "workspace-index-full":
+        workspace_file = _resolve_workspace_file(
+            settings.repo_root,
+            getattr(args, "workspace_file", None),
+        )
+        plugin_manager = PluginManager.from_repo(settings.repo_root)
+        payload = _run_workspace_full_index(
+            repo_root=settings.repo_root,
+            workspace_file=workspace_file,
+            workers=max(1, int(getattr(args, "workers", 4))),
+            args=args,
+            include_disabled=bool(getattr(args, "include_disabled", False)),
+            plugin_manager=plugin_manager,
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    plugin_manager = PluginManager.from_repo(settings.repo_root)
     db = Database(settings.db_path)
     db.init_schema()
 
@@ -990,6 +1395,7 @@ def main() -> None:
             db,
             int(getattr(args, "workers", 4)),
             args=args,
+            plugin_manager=plugin_manager,
         )
         sync_payload = _run_hybrid_sync(settings.repo_root, db, args, changes=_all_file_changes(db))
         if sync_payload is not None:
@@ -1005,6 +1411,7 @@ def main() -> None:
             int(getattr(args, "workers", 4)),
             changes=changes,
             args=args,
+            plugin_manager=plugin_manager,
         )
         sync_payload = _run_hybrid_sync(settings.repo_root, db, args, changes=changes)
         if sync_payload is not None:
@@ -1017,7 +1424,32 @@ def main() -> None:
             db,
             settings.repo_root,
             diagnostics_limit=max(1, int(getattr(args, "diagnostics_limit", 50))),
+            plugin_manager=plugin_manager,
         )
+        print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "inspect-export":
+        bundle = build_inspector_bundle(
+            db,
+            node_limit=max(1, int(getattr(args, "node_limit", 300))),
+            edge_limit=max(1, int(getattr(args, "edge_limit", 500))),
+            diagnostics_limit=max(1, int(getattr(args, "diagnostics_limit", 50))),
+        )
+        output_path_raw = getattr(args, "output", Path("ui") / "bundle.json")
+        output_path = (
+            output_path_raw
+            if isinstance(output_path_raw, Path) and output_path_raw.is_absolute()
+            else settings.repo_root / Path(str(output_path_raw))
+        ).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(bundle, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        payload = {
+            "output": output_path.as_posix(),
+            "node_count": len(bundle.get("nodes", [])),
+            "edge_count": len(bundle.get("edges", [])),
+            "diagnostics_count": len(bundle.get("diagnostics", [])),
+        }
         print(json.dumps(payload, sort_keys=True))
         return
 
@@ -1050,17 +1482,23 @@ def main() -> None:
         return
 
     if command == "doctor":
-        payload = _doctor_payload(db, settings.repo_root, args)
+        payload = _doctor_payload(db, settings.repo_root, args, plugin_manager=plugin_manager)
         print(json.dumps(payload, sort_keys=True))
         return
 
     if command == "watch":
-        payload = _run_watch(settings.repo_root, db, args)
+        payload = _run_watch(settings.repo_root, db, args, plugin_manager=plugin_manager)
         print(json.dumps(payload, sort_keys=True))
         return
 
     if str(getattr(args, "index_mode", "none")) == "full":
-        _run_full_index(settings.repo_root, db, workers=4, args=args)
+        _run_full_index(
+            settings.repo_root,
+            db,
+            workers=4,
+            args=args,
+            plugin_manager=plugin_manager,
+        )
         _run_hybrid_sync(settings.repo_root, db, args, changes=_all_file_changes(db))
     elif str(getattr(args, "index_mode", "none")) == "incremental":
         serve_changes = get_changed_files(
@@ -1068,7 +1506,14 @@ def main() -> None:
             include_patterns=_pattern_list(getattr(args, "include", [])),
             exclude_patterns=_pattern_list(getattr(args, "exclude", [])),
         )
-        _run_incremental_index(settings.repo_root, db, workers=4, changes=serve_changes, args=args)
+        _run_incremental_index(
+            settings.repo_root,
+            db,
+            workers=4,
+            changes=serve_changes,
+            args=args,
+            plugin_manager=plugin_manager,
+        )
         _run_hybrid_sync(settings.repo_root, db, args, changes=serve_changes)
 
     class LocalServer:
@@ -1095,7 +1540,12 @@ def main() -> None:
             }
 
     server = LocalServer()
-    register_tools(server, db, settings.repo_root.as_posix())
+    register_tools(
+        server,
+        db,
+        settings.repo_root.as_posix(),
+        plugin_manager=plugin_manager,
+    )
     logging.getLogger(__name__).info(
         "Registered %d tool handlers.", len(server.tools)
     )

@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  bombe:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    command: ["--repo", "/workspace", "serve"]
+    environment:
+      - BOMBE_EXCLUDE_SENSITIVE=1
+      - BOMBE_HYBRID_SEARCH=1
+    volumes:
+      - ../../:/workspace:ro

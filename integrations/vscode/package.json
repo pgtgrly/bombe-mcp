@@ -1,0 +1,29 @@
+{
+  "name": "bombe-vscode",
+  "displayName": "Bombe",
+  "description": "VS Code integration scaffold for Bombe MCP server.",
+  "version": "0.0.1",
+  "publisher": "bombe",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:bombe.status"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "bombe.status",
+        "title": "Bombe: Show Status"
+      }
+    ]
+  },
+  "scripts": {
+    "lint": "echo \"No lints configured\"",
+    "test": "echo \"No tests configured\""
+  }
+}

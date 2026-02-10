@@ -51,6 +51,21 @@ Work is split into two waves.
 
 Wave 2 begins only after Wave 1 gates are green for two consecutive CI runs and one real-repo run.
 
+## Strategic Alternative: The Rust Rewrite
+Based on feasibility analysis (`rust_rewrite_analysis.md`), a full rewrite in Rust is a viable path to becoming the "De Facto Standard".
+
+### Feasibility Summary
+- **Feasibility**: **High**. All required components have robust Rust equivalents (`clap`, `rusqlite`, `tree-sitter`, `axum`).
+- **Effort**: **High (4-6 weeks)**. Requires rewriting the core indexer and MCP server layer.
+- **Payoff**:
+    - **Performance**: 10-50x faster indexing (Rayon parallelism).
+    - **Deployment**: Single static binary (no Python venv hell).
+    - **Concurrency**: Handle 100s of agents via async Tokio.
+
+### Execution Option
+If selected, this replaces Phases 3A, 9, 10, and 15 with a ground-up rewrite.
+See `rust_rewrite_analysis.md` for the full migration plan.
+
 ## Global Execution Protocol
 Each phase follows this loop:
 

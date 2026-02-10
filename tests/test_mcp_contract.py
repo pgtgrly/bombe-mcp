@@ -83,6 +83,8 @@ class MCPContractTests(unittest.TestCase):
                 "get_entry_points",
                 "get_hot_paths",
                 "get_orphan_symbols",
+                "search_workspace_symbols",
+                "get_workspace_status",
             })
             self.assertIsNotNone(fake_server.registered["search_symbols"]["input_schema"])
 
@@ -231,6 +233,7 @@ class MCPContractTests(unittest.TestCase):
                     "recent_indexing_diagnostics",
                     "tool_metrics_summary",
                     "planner_cache",
+                    "plugin_manager",
                     "recent_tool_metrics",
                 },
             )
@@ -330,6 +333,39 @@ class MCPContractTests(unittest.TestCase):
                     },
                 )
 
+            workspace_search_payload = registry["search_workspace_symbols"]["handler"](
+                {"query": "auth", "limit": 10}
+            )
+            self.assertEqual(
+                set(workspace_search_payload.keys()),
+                {
+                    "workspace_name",
+                    "symbols",
+                    "total_matches",
+                    "roots_considered",
+                    "root_errors",
+                },
+            )
+
+            workspace_status_payload = registry["get_workspace_status"]["handler"](
+                {"diagnostics_limit": 10}
+            )
+            self.assertEqual(
+                set(workspace_status_payload.keys()),
+                {"workspace_name", "roots", "totals"},
+            )
+            self.assertEqual(
+                set(workspace_status_payload["totals"].keys()),
+                {
+                    "roots",
+                    "roots_ok",
+                    "files",
+                    "symbols",
+                    "edges",
+                    "indexing_diagnostics_errors",
+                },
+            )
+
             metric_rows = db.query(
                 """
                 SELECT tool_name, success
@@ -337,7 +373,7 @@ class MCPContractTests(unittest.TestCase):
                 ORDER BY id;
                 """
             )
-            self.assertGreaterEqual(len(metric_rows), 14)
+            self.assertGreaterEqual(len(metric_rows), 16)
             self.assertTrue(all(int(row["success"]) == 1 for row in metric_rows))
 
 

@@ -182,6 +182,21 @@ class FileChange:
 
 
 @dataclass(frozen=True)
+class WorkspaceRoot:
+    id: str
+    path: str
+    db_path: str
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class WorkspaceConfig:
+    name: str
+    version: int
+    roots: list[WorkspaceRoot] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class FileDelta:
     status: str
     path: str

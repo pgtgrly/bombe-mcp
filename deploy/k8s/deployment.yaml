@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bombe
+  labels:
+    app: bombe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bombe
+  template:
+    metadata:
+      labels:
+        app: bombe
+    spec:
+      containers:
+      - name: bombe
+        image: bombe:latest
+        args: ["--repo", "/workspace", "serve"]
+        env:
+        - name: BOMBE_EXCLUDE_SENSITIVE
+          value: "1"
+        - name: BOMBE_HYBRID_SEARCH
+          value: "1"
+        readinessProbe:
+          exec:
+            command: ["python", "-m", "bombe.server", "--repo", "/workspace", "preflight"]
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        livenessProbe:
+          exec:
+            command: ["python", "-m", "bombe.server", "--repo", "/workspace", "preflight"]
+          initialDelaySeconds: 10
+          periodSeconds: 60
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      volumes:
+      - name: workspace
+        emptyDir: {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 
 from bombe.query.guards import MAX_SEARCH_LIMIT, clamp_limit, truncate_query
+from bombe.query.hybrid import rank_symbol
 from bombe.models import SymbolSearchRequest, SymbolSearchResponse
 from bombe.store.database import Database
 
@@ -43,7 +44,7 @@ def _search_with_like(conn, req: SymbolSearchRequest):
         params.append(req.file_pattern.replace("*", "%"))
 
     sql = f"""
-        SELECT id, name, qualified_name, kind, file_path, start_line, end_line, signature,
+        SELECT id, name, qualified_name, kind, file_path, start_line, end_line, signature, docstring,
                visibility, pagerank_score
         FROM symbols
         WHERE {' AND '.join(where_clauses)}
@@ -70,7 +71,7 @@ def _search_with_fts(conn, req: SymbolSearchRequest):
 
     sql = f"""
         SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path, s.start_line, s.end_line,
-               s.signature, s.visibility, s.pagerank_score, bm25(symbol_fts) AS rank
+               s.signature, s.docstring, s.visibility, s.pagerank_score, bm25(symbol_fts) AS rank
         FROM symbol_fts f
         JOIN symbols s ON s.id = f.symbol_id
         WHERE {' AND '.join(where_clauses)}
@@ -90,39 +91,85 @@ def search_symbols(db: Database, req: SymbolSearchRequest) -> SymbolSearchRespon
     with closing(db.connect()) as conn:
         search_mode = "like"
         try:
-            rows = _search_with_fts(conn, normalized_request)
-            if rows:
-                search_mode = "fts"
+            fts_rows = _search_with_fts(
+                conn,
+                SymbolSearchRequest(
+                    query=normalized_request.query,
+                    kind=normalized_request.kind,
+                    file_pattern=normalized_request.file_pattern,
+                    limit=clamp_limit(normalized_request.limit * 3, maximum=MAX_SEARCH_LIMIT),
+                ),
+            )
         except Exception:
-            rows = []
-        if not rows:
-            rows = _search_with_like(conn, normalized_request)
-            search_mode = "like"
+            fts_rows = []
+        like_rows = _search_with_like(
+            conn,
+            SymbolSearchRequest(
+                query=normalized_request.query,
+                kind=normalized_request.kind,
+                file_pattern=normalized_request.file_pattern,
+                limit=clamp_limit(normalized_request.limit * 3, maximum=MAX_SEARCH_LIMIT),
+            ),
+        )
+        combined: dict[int, object] = {}
+        strategy_by_id: dict[int, str] = {}
+        for row in like_rows:
+            symbol_id = int(row["id"])
+            combined[symbol_id] = row
+            strategy_by_id[symbol_id] = "like"
+        for row in fts_rows:
+            symbol_id = int(row["id"])
+            combined[symbol_id] = row
+            strategy_by_id[symbol_id] = "fts"
+        search_mode = "fts" if fts_rows else "like"
+        rows = list(combined.values())
 
-        payload: list[dict[str, object]] = []
+        scored_payload: list[tuple[float, dict[str, object]]] = []
         for row in rows:
             symbol_id = int(row["id"])
             callers_count, callees_count = _count_refs(conn, symbol_id)
             file_pattern = normalized_request.file_pattern or "*"
+            strategy = strategy_by_id.get(symbol_id, search_mode)
+            ranking_score = rank_symbol(
+                query=normalized_request.query,
+                name=str(row["name"]),
+                qualified_name=str(row["qualified_name"]),
+                signature=str(row["signature"]) if row["signature"] is not None else None,
+                docstring=str(row["docstring"]) if row["docstring"] is not None else None,
+                pagerank=float(row["pagerank_score"] or 0.0),
+                callers=callers_count,
+                callees=callees_count,
+            )
             match_reason = (
                 f"{search_mode}:query='{normalized_request.query}',kind='{normalized_request.kind}',file='{file_pattern}'"
             )
-            payload.append(
-                {
-                    "name": row["name"],
-                    "qualified_name": row["qualified_name"],
-                    "kind": row["kind"],
-                    "file_path": row["file_path"],
-                    "start_line": row["start_line"],
-                    "end_line": row["end_line"],
-                    "signature": row["signature"],
-                    "visibility": row["visibility"],
-                    "importance_score": row["pagerank_score"],
-                    "callers_count": callers_count,
-                    "callees_count": callees_count,
-                    "match_strategy": search_mode,
-                    "match_reason": match_reason,
-                }
+            scored_payload.append(
+                (
+                    float(ranking_score),
+                    {
+                        "name": row["name"],
+                        "qualified_name": row["qualified_name"],
+                        "kind": row["kind"],
+                        "file_path": row["file_path"],
+                        "start_line": row["start_line"],
+                        "end_line": row["end_line"],
+                        "signature": row["signature"],
+                        "visibility": row["visibility"],
+                        "importance_score": row["pagerank_score"],
+                        "callers_count": callers_count,
+                        "callees_count": callees_count,
+                        "match_strategy": strategy,
+                        "match_reason": match_reason,
+                    },
+                )
             )
+        scored_payload.sort(
+            key=lambda item: (
+                -float(item[0]),
+                str(item[1]["qualified_name"]),
+                str(item[1]["file_path"]),
+            )
+        )
+        payload = [item[1] for item in scored_payload[: normalized_request.limit]]
 
     return SymbolSearchResponse(symbols=payload, total_matches=len(payload))

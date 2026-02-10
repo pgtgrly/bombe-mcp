@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from bombe.lsp.bridge import lsp_backend_statuses, load_lsp_receiver_hints
+
 
 def backend_statuses() -> list[dict[str, Any]]:
     backends = [
@@ -26,6 +28,11 @@ def backend_statuses() -> list[dict[str, Any]]:
                 "executable": location,
             }
         )
+    bridge_payload = {item["backend"]: item for item in lsp_backend_statuses()}
+    for item in payload:
+        bridge_entry = bridge_payload.get(item["backend"])
+        if bridge_entry is not None:
+            item["lsp_bridge_available"] = bool(bridge_entry.get("available", False))
     return payload
 
 
@@ -127,4 +134,5 @@ def load_receiver_type_hints(
                     file_payload = files.get(candidate)
                     if isinstance(file_payload, dict):
                         _merge_hint_maps(hints, _parse_hint_payload(file_payload))
+    _merge_hint_maps(hints, load_lsp_receiver_hints(repo_root, normalized_relative_path))
     return hints

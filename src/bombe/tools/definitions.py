@@ -34,11 +34,13 @@ from bombe.query.blast import get_blast_radius
 from bombe.query.change_impact import change_impact
 from bombe.query.context import get_context
 from bombe.query.data_flow import trace_data_flow
+from bombe.plugins import PluginManager
 from bombe.query.planner import QueryPlanner
 from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.query.structure import get_structure
 from bombe.store.database import Database
+from bombe.workspace import enabled_workspace_roots, load_workspace_config
 
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any] | str]
@@ -204,6 +206,31 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_tests": {"type": "boolean", "default": False},
         },
     },
+    "search_workspace_symbols": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": ["function", "class", "method", "interface", "constant", "any"],
+                "default": "any",
+            },
+            "file_pattern": {"type": "string"},
+            "limit": {"type": "integer", "default": 20},
+            "offset": {"type": "integer", "default": 0},
+            "roots": {"type": "array", "items": {"type": "string"}},
+            "include_disabled": {"type": "boolean", "default": False},
+        },
+        "required": ["query"],
+    },
+    "get_workspace_status": {
+        "type": "object",
+        "properties": {
+            "roots": {"type": "array", "items": {"type": "string"}},
+            "include_disabled": {"type": "boolean", "default": False},
+            "diagnostics_limit": {"type": "integer", "default": 20},
+        },
+    },
 }
 
 
@@ -352,23 +379,29 @@ def _instrument_handler(
     tool_name: str,
     handler: ToolHandler,
     planner: QueryPlanner | None = None,
+    plugin_manager: PluginManager | None = None,
 ) -> ToolHandler:
     def wrapped(payload: dict[str, Any]) -> dict[str, Any] | str:
         started = time.perf_counter()
         mode = "local"
         plan_trace: dict[str, float | str] | None = None
+        effective_payload = dict(payload)
+        if plugin_manager is not None:
+            maybe_payload = plugin_manager.before_query(tool_name, effective_payload)
+            if isinstance(maybe_payload, dict):
+                effective_payload = maybe_payload
         try:
             if planner is not None:
                 result, mode, plan_trace = planner.get_or_compute_with_trace(
                     tool_name=tool_name,
-                    payload=payload,
-                    compute=lambda: handler(payload),
+                    payload=effective_payload,
+                    compute=lambda: handler(effective_payload),
                     version_token=_cache_version_token(db),
                 )
             else:
-                result = handler(payload)
+                result = handler(effective_payload)
             latency_ms = (time.perf_counter() - started) * 1000.0
-            if bool(payload.get("include_plan", False)) and isinstance(result, dict):
+            if bool(effective_payload.get("include_plan", False)) and isinstance(result, dict):
                 trace_payload: dict[str, float | str] = {
                     "cache_mode": mode,
                 }
@@ -385,6 +418,8 @@ def _instrument_handler(
                 result_size=_result_size(result),
                 error_message=None,
             )
+            if plugin_manager is not None:
+                plugin_manager.after_query(tool_name, effective_payload, result, error=None)
             return result
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000.0
@@ -398,6 +433,8 @@ def _instrument_handler(
                 result_size=None,
                 error_message=str(exc),
             )
+            if plugin_manager is not None:
+                plugin_manager.after_query(tool_name, effective_payload, None, error=str(exc))
             logging.getLogger(__name__).exception("Tool handler failed: %s", tool_name)
             raise
 
@@ -568,6 +605,7 @@ def _server_status_handler(
     repo_root: str,
     payload: dict[str, Any],
     planner: QueryPlanner | None = None,
+    plugin_manager: PluginManager | None = None,
 ) -> dict[str, Any]:
     diagnostics_limit = max(1, int(payload.get("diagnostics_limit", 20)))
     metrics_limit = max(1, int(payload.get("metrics_limit", 20)))
@@ -596,6 +634,7 @@ def _server_status_handler(
         "recent_indexing_diagnostics": db.list_indexing_diagnostics(limit=diagnostics_limit),
         "tool_metrics_summary": metrics_summary,
         "planner_cache": planner.stats() if planner is not None else {"entries": 0, "max_entries": 0},
+        "plugin_manager": plugin_manager.stats() if plugin_manager is not None else {"plugins_loaded": 0},
         "recent_tool_metrics": db.query(
             """
             SELECT tool_name, latency_ms, success, mode, result_size, error_message, created_at
@@ -832,91 +871,295 @@ def _orphan_symbols_handler(db: Database, payload: dict[str, Any]) -> dict[str, 
     return {"orphan_symbols": orphaned[:limit], "total_orphans": len(orphaned)}
 
 
-def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any]]:
+def _resolve_workspace_roots(repo_root: str, payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    config = load_workspace_config(Path(repo_root))
+    include_disabled = bool(payload.get("include_disabled", False))
+    selected = config.roots if include_disabled else enabled_workspace_roots(config)
+    requested_roots_raw = payload.get("roots", [])
+    requested_roots = {
+        str(item).strip()
+        for item in requested_roots_raw
+        if isinstance(item, str) and str(item).strip()
+    }
+    roots: list[dict[str, Any]] = []
+    for root in selected:
+        if requested_roots and root.id not in requested_roots and root.path not in requested_roots:
+            continue
+        roots.append(
+            {
+                "id": root.id,
+                "path": root.path,
+                "db_path": root.db_path,
+                "enabled": bool(root.enabled),
+            }
+        )
+    return config.name, roots
+
+
+def _workspace_search_handler(db: Database, repo_root: str, payload: dict[str, Any]) -> dict[str, Any]:
+    del db
+    limit = clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT)
+    offset = max(0, int(payload.get("offset", 0)))
+    request_limit = clamp_limit(limit + offset, maximum=MAX_SEARCH_LIMIT)
+    workspace_name, roots = _resolve_workspace_roots(repo_root, payload)
+    results: list[dict[str, Any]] = []
+    root_errors: list[dict[str, Any]] = []
+    for root in roots:
+        root_path = Path(str(root["path"]))
+        db_path = Path(str(root["db_path"]))
+        if not root_path.exists() or not root_path.is_dir():
+            root_errors.append(
+                {
+                    "root_id": str(root["id"]),
+                    "root_path": str(root["path"]),
+                    "error": "missing_root",
+                }
+            )
+            continue
+        try:
+            root_db = Database(db_path)
+            root_db.init_schema()
+            response = search_symbols(
+                root_db,
+                SymbolSearchRequest(
+                    query=truncate_query(str(payload["query"])),
+                    kind=str(payload.get("kind", "any")),
+                    file_pattern=payload.get("file_pattern"),
+                    limit=request_limit,
+                ),
+            )
+        except Exception as exc:
+            root_errors.append(
+                {
+                    "root_id": str(root["id"]),
+                    "root_path": str(root["path"]),
+                    "error": str(exc),
+                }
+            )
+            continue
+        for symbol in response.symbols:
+            if not isinstance(symbol, dict):
+                continue
+            results.append(
+                {
+                    **symbol,
+                    "workspace_root_id": str(root["id"]),
+                    "workspace_root_path": str(root["path"]),
+                }
+            )
+    results.sort(
+        key=lambda item: (
+            -float(item.get("importance_score", 0.0)),
+            str(item.get("qualified_name", "")),
+            str(item.get("workspace_root_path", "")),
+        )
+    )
+    paged = results[offset: offset + limit]
+    payload_out: dict[str, Any] = {
+        "workspace_name": workspace_name,
+        "symbols": paged,
+        "total_matches": len(results),
+        "roots_considered": len(roots),
+        "root_errors": root_errors,
+    }
+    if "offset" in payload or offset > 0:
+        next_offset = offset + len(paged)
+        payload_out["pagination"] = {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(paged),
+            "next_offset": next_offset if next_offset < len(results) else None,
+        }
+    return payload_out
+
+
+def _workspace_status_handler(db: Database, repo_root: str, payload: dict[str, Any]) -> dict[str, Any]:
+    del db
+    diagnostics_limit = max(1, int(payload.get("diagnostics_limit", 20)))
+    workspace_name, roots = _resolve_workspace_roots(repo_root, payload)
+    statuses: list[dict[str, Any]] = []
+    totals = {
+        "roots": 0,
+        "roots_ok": 0,
+        "files": 0,
+        "symbols": 0,
+        "edges": 0,
+        "indexing_diagnostics_errors": 0,
+    }
+    for root in roots:
+        root_path = Path(str(root["path"]))
+        db_path = Path(str(root["db_path"]))
+        status_item: dict[str, Any] = {
+            "root_id": str(root["id"]),
+            "root_path": str(root["path"]),
+            "db_path": str(root["db_path"]),
+            "enabled": bool(root["enabled"]),
+        }
+        totals["roots"] += 1
+        if not root_path.exists() or not root_path.is_dir():
+            status_item["status"] = "missing_root"
+            statuses.append(status_item)
+            continue
+        try:
+            root_db = Database(db_path)
+            root_db.init_schema()
+            file_rows = root_db.query("SELECT COUNT(*) AS count FROM files;")
+            symbol_rows = root_db.query("SELECT COUNT(*) AS count FROM symbols;")
+            edge_rows = root_db.query("SELECT COUNT(*) AS count FROM edges;")
+            diagnostics = root_db.summarize_indexing_diagnostics()
+            status_item["status"] = "ok"
+            status_item["counts"] = {
+                "files": int(file_rows[0]["count"]) if file_rows else 0,
+                "symbols": int(symbol_rows[0]["count"]) if symbol_rows else 0,
+                "edges": int(edge_rows[0]["count"]) if edge_rows else 0,
+                "indexing_diagnostics_errors": int(
+                    diagnostics.get("by_severity", {}).get("error", 0)
+                ),
+            }
+            status_item["recent_indexing_diagnostics"] = root_db.list_indexing_diagnostics(
+                limit=diagnostics_limit
+            )
+            totals["roots_ok"] += 1
+            totals["files"] += int(status_item["counts"]["files"])
+            totals["symbols"] += int(status_item["counts"]["symbols"])
+            totals["edges"] += int(status_item["counts"]["edges"])
+            totals["indexing_diagnostics_errors"] += int(
+                status_item["counts"]["indexing_diagnostics_errors"]
+            )
+        except Exception as exc:
+            status_item["status"] = "error"
+            status_item["error"] = str(exc)
+        statuses.append(status_item)
+    return {
+        "workspace_name": workspace_name,
+        "roots": statuses,
+        "totals": totals,
+    }
+
+
+def build_tool_registry(
+    db: Database,
+    repo_root: str,
+    plugin_manager: PluginManager | None = None,
+) -> dict[str, dict[str, Any]]:
     planner = QueryPlanner(max_entries=1024, ttl_seconds=30.0)
     search_handler = _instrument_handler(
         db,
         "search_symbols",
         lambda payload: _search_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     references_handler = _instrument_handler(
         db,
         "get_references",
         lambda payload: _references_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     context_handler = _instrument_handler(
         db,
         "get_context",
         lambda payload: _context_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     structure_handler = _instrument_handler(
         db,
         "get_structure",
         lambda payload: _structure_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     blast_handler = _instrument_handler(
         db,
         "get_blast_radius",
         lambda payload: _blast_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     data_flow_handler = _instrument_handler(
         db,
         "trace_data_flow",
         lambda payload: _data_flow_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     impact_handler = _instrument_handler(
         db,
         "change_impact",
         lambda payload: _change_impact_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     diagnostics_handler = _instrument_handler(
         db,
         "get_indexing_diagnostics",
         lambda payload: _indexing_diagnostics_handler(db, payload),
         planner=None,
+        plugin_manager=plugin_manager,
     )
     status_handler = _instrument_handler(
         db,
         "get_server_status",
-        lambda payload: _server_status_handler(db, repo_root, payload, planner=planner),
+        lambda payload: _server_status_handler(
+            db,
+            repo_root,
+            payload,
+            planner=planner,
+            plugin_manager=plugin_manager,
+        ),
         planner=None,
+        plugin_manager=plugin_manager,
     )
     estimate_context_handler = _instrument_handler(
         db,
         "estimate_context_size",
         lambda payload: _estimate_context_size_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     context_summary_handler = _instrument_handler(
         db,
         "get_context_summary",
         lambda payload: _context_summary_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     entry_points_handler = _instrument_handler(
         db,
         "get_entry_points",
         lambda payload: _entry_point_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     hot_paths_handler = _instrument_handler(
         db,
         "get_hot_paths",
         lambda payload: _hot_paths_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
     )
     orphan_symbols_handler = _instrument_handler(
         db,
         "get_orphan_symbols",
         lambda payload: _orphan_symbols_handler(db, payload),
         planner=planner,
+        plugin_manager=plugin_manager,
+    )
+    workspace_search_handler = _instrument_handler(
+        db,
+        "search_workspace_symbols",
+        lambda payload: _workspace_search_handler(db, repo_root, payload),
+        planner=planner,
+        plugin_manager=plugin_manager,
+    )
+    workspace_status_handler = _instrument_handler(
+        db,
+        "get_workspace_status",
+        lambda payload: _workspace_status_handler(db, repo_root, payload),
+        planner=None,
+        plugin_manager=plugin_manager,
     )
     return {
         "search_symbols": {
@@ -989,11 +1232,26 @@ def build_tool_registry(db: Database, repo_root: str) -> dict[str, dict[str, Any
             "input_schema": TOOL_SCHEMAS["get_orphan_symbols"],
             "handler": orphan_symbols_handler,
         },
+        "search_workspace_symbols": {
+            "description": "Search symbols across all configured workspace roots.",
+            "input_schema": TOOL_SCHEMAS["search_workspace_symbols"],
+            "handler": workspace_search_handler,
+        },
+        "get_workspace_status": {
+            "description": "Return aggregated status across configured workspace roots.",
+            "input_schema": TOOL_SCHEMAS["get_workspace_status"],
+            "handler": workspace_status_handler,
+        },
     }
 
 
-def register_tools(server: Any, db: Database, repo_root: str) -> None:
-    registry = build_tool_registry(db, repo_root)
+def register_tools(
+    server: Any,
+    db: Database,
+    repo_root: str,
+    plugin_manager: PluginManager | None = None,
+) -> None:
+    registry = build_tool_registry(db, repo_root, plugin_manager=plugin_manager)
     if hasattr(server, "register_tool"):
         for tool_name, tool in registry.items():
             try:

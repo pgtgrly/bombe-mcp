@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bombe Inspector</title>
+  <meta name="description" content="Bombe code intelligence graph inspector and query explainer.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="panel panel-hero">
+      <h1>Bombe Inspector</h1>
+      <p>Read-only graph and diagnostics view exported from local index state.</p>
+      <div id="summary" class="summary"></div>
+      <div id="limits-warning" class="warning hidden"></div>
+    </section>
+    <section class="panel">
+      <h2>Hot Paths</h2>
+      <ul id="hot-paths" class="list"></ul>
+    </section>
+    <section class="panel">
+      <h2>Recent Diagnostics</h2>
+      <ul id="diagnostics" class="list"></ul>
+    </section>
+    <section class="panel panel-wide">
+      <h2>Graph Preview</h2>
+      <div id="graph" class="graph"></div>
+      <div id="graph-pagination" class="pagination hidden"></div>
+    </section>
+    <section class="panel panel-wide">
+      <h2>Query Explainer</h2>
+      <p class="hint">Click any node above to see why it ranks where it does.</p>
+      <div id="explainer" class="explainer"></div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

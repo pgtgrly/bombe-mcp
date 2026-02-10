@@ -20,6 +20,7 @@ class ServerCLITests(unittest.TestCase):
         self.assertEqual(args.log_level, "INFO")
         self.assertEqual(str(args.runtime_profile), "default")
         self.assertEqual(int(args.diagnostics_limit), 50)
+        self.assertIsNone(args.control_plane_url)
         self.assertEqual(list(args.include), [])
         self.assertEqual(list(args.exclude), [])
         doctor_args = parser.parse_args(["doctor"])
@@ -29,6 +30,10 @@ class ServerCLITests(unittest.TestCase):
         doctor_fix_args = parser.parse_args(["doctor", "--fix"])
         watch_args = parser.parse_args(["watch", "--max-cycles", "1"])
         watch_fs_args = parser.parse_args(["watch", "--watch-mode", "fs", "--max-cycles", "1"])
+        workspace_init_args = parser.parse_args(["workspace-init", "--name", "demo-workspace"])
+        workspace_status_args = parser.parse_args(["workspace-status"])
+        workspace_index_args = parser.parse_args(["workspace-index-full", "--workers", "2"])
+        inspect_args = parser.parse_args(["inspect-export", "--output", "ui/bundle.json"])
         self.assertEqual(doctor_args.command, "doctor")
         self.assertEqual(diagnostics_args.command, "diagnostics")
         self.assertEqual(str(diagnostics_args.run_id), "run_1")
@@ -40,6 +45,12 @@ class ServerCLITests(unittest.TestCase):
         self.assertEqual(watch_args.command, "watch")
         self.assertEqual(str(watch_fs_args.watch_mode), "fs")
         self.assertEqual(int(watch_args.max_cycles), 1)
+        self.assertEqual(workspace_init_args.command, "workspace-init")
+        self.assertEqual(str(workspace_init_args.name), "demo-workspace")
+        self.assertEqual(workspace_status_args.command, "workspace-status")
+        self.assertEqual(workspace_index_args.command, "workspace-index-full")
+        self.assertEqual(int(workspace_index_args.workers), 2)
+        self.assertEqual(inspect_args.command, "inspect-export")
 
     def test_index_and_status_commands_emit_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -249,6 +260,99 @@ class ServerCLITests(unittest.TestCase):
             self.assertEqual(str(diagnostics_payload["filters"]["run_id"]), str(full_payload["run_id"]))
             self.assertIn("summary", diagnostics_payload)
             self.assertIn("diagnostics", diagnostics_payload)
+
+            workspace_init = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "workspace-init",
+                    "--name",
+                    "demo-workspace",
+                    "--root",
+                    repo_root.as_posix(),
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            workspace_init_payload = json.loads(workspace_init.stdout.strip())
+            self.assertEqual(str(workspace_init_payload["workspace_name"]), "demo-workspace")
+            self.assertGreaterEqual(len(workspace_init_payload["roots"]), 1)
+
+            workspace_status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "workspace-status",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            workspace_status_payload = json.loads(workspace_status.stdout.strip())
+            self.assertIn("roots", workspace_status_payload)
+            self.assertIn("totals", workspace_status_payload)
+            self.assertGreaterEqual(int(workspace_status_payload["totals"]["roots"]), 1)
+
+            workspace_index = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "workspace-index-full",
+                    "--workers",
+                    "2",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            workspace_index_payload = json.loads(workspace_index.stdout.strip())
+            self.assertIn("totals", workspace_index_payload)
+            self.assertGreaterEqual(int(workspace_index_payload["totals"]["roots_indexed"]), 1)
+
+            inspect_export = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bombe.server",
+                    "--repo",
+                    repo_root.as_posix(),
+                    "--log-level",
+                    "ERROR",
+                    "inspect-export",
+                    "--output",
+                    "ui/bundle.json",
+                ],
+                cwd=project_root.as_posix(),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            inspect_payload = json.loads(inspect_export.stdout.strip())
+            self.assertIn("output", inspect_payload)
+            self.assertGreaterEqual(int(inspect_payload["node_count"]), 1)
 
             watch_fs = subprocess.run(
                 [

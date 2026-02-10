@@ -17,6 +17,7 @@ class SemanticTests(unittest.TestCase):
         self.assertIn("backend", first)
         self.assertIn("available", first)
         self.assertIn("executable", first)
+        self.assertIn("lsp_bridge_available", first)
 
     def test_load_receiver_type_hints_from_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -80,6 +81,40 @@ class SemanticTests(unittest.TestCase):
                     os.environ["BOMBE_SEMANTIC_HINTS_FILE"] = previous
             self.assertIn((7, "svc"), hints)
             self.assertIn("SearchService", hints[(7, "svc")])
+
+    def test_load_receiver_type_hints_merges_lsp_sidecar_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            lsp_dir = repo_root / ".bombe" / "lsp" / "src"
+            lsp_dir.mkdir(parents=True, exist_ok=True)
+            hint_file = lsp_dir / "main.py.hints.json"
+            hint_file.write_text(
+                json.dumps(
+                    {
+                        "receiver_hints": [
+                            {
+                                "receiver": "client",
+                                "owner_type": "HttpClient",
+                                "line_start": 20,
+                                "line_end": 20,
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            previous = os.environ.get("BOMBE_ENABLE_LSP_HINTS")
+            os.environ["BOMBE_ENABLE_LSP_HINTS"] = "1"
+            try:
+                hints = load_receiver_type_hints(repo_root, "src/main.py")
+            finally:
+                if previous is None:
+                    os.environ.pop("BOMBE_ENABLE_LSP_HINTS", None)
+                else:
+                    os.environ["BOMBE_ENABLE_LSP_HINTS"] = previous
+            self.assertIn((20, "client"), hints)
+            self.assertIn("HttpClient", hints[(20, "client")])
 
 
 if __name__ == "__main__":
