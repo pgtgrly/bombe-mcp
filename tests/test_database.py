@@ -29,7 +29,7 @@ class DatabaseTests(unittest.TestCase):
             version = db.query(
                 "SELECT value FROM repo_meta WHERE key = 'schema_version';"
             )
-            self.assertEqual(version[0]["value"], "6")
+            self.assertEqual(version[0]["value"], "7")
 
     def test_replace_file_symbols_persists_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,7 +201,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "6")
+            self.assertEqual(version[0]["value"], "7")
             fts_table = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'symbol_fts';"
             )
@@ -228,7 +228,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "6")
+            self.assertEqual(version[0]["value"], "7")
             table_rows = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trusted_signing_keys';"
             )
@@ -263,7 +263,7 @@ class DatabaseTests(unittest.TestCase):
 
             db.init_schema()
             version = db.query("SELECT value FROM repo_meta WHERE key = 'schema_version';")
-            self.assertEqual(version[0]["value"], "6")
+            self.assertEqual(version[0]["value"], "7")
             table_rows = db.query(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'indexing_diagnostics';"
             )

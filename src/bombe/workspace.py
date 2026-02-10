@@ -8,7 +8,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from bombe.models import WorkspaceConfig, WorkspaceRoot
+from bombe.models import ShardGroupConfig, ShardInfo, WorkspaceConfig, WorkspaceRoot
+from bombe.models import _repo_id_from_path
 
 
 WORKSPACE_SCHEMA_VERSION = 1
@@ -151,3 +152,53 @@ def load_workspace_config(
 
 def enabled_workspace_roots(config: WorkspaceConfig) -> list[WorkspaceRoot]:
     return [root for root in config.roots if bool(root.enabled)]
+
+
+def load_shard_group_config(
+    repo_root: Path,
+    workspace_file: Path | None = None,
+) -> ShardGroupConfig | None:
+    """Load shard group configuration from workspace.json.
+
+    Returns None if sharding is not enabled or workspace.json has no
+    ``shard_group`` key.
+    """
+    source = (workspace_file or default_workspace_file(repo_root)).expanduser().resolve()
+    if not source.exists():
+        return None
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    shard_group = payload.get("shard_group")
+    if not isinstance(shard_group, dict) or not shard_group.get("enabled"):
+        return None
+
+    # Load workspace config for the root list
+    config = load_workspace_config(repo_root, workspace_file=workspace_file)
+    selected = enabled_workspace_roots(config)
+
+    catalog_db_raw = shard_group.get("catalog_db_path", ".bombe/shard_catalog.db")
+    catalog_db_path = (repo_root / catalog_db_raw).expanduser().resolve().as_posix()
+
+    shards: list[ShardInfo] = []
+    for root in selected:
+        normalized = _normalize_root_path(Path(root.path))
+        repo_id = _repo_id_from_path(normalized.as_posix())
+        shards.append(
+            ShardInfo(
+                repo_id=repo_id,
+                repo_path=normalized.as_posix(),
+                db_path=root.db_path,
+                enabled=root.enabled,
+            )
+        )
+
+    return ShardGroupConfig(
+        name=config.name,
+        catalog_db_path=catalog_db_path,
+        shards=shards,
+    )

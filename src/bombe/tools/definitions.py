@@ -39,7 +39,10 @@ from bombe.query.planner import QueryPlanner
 from bombe.query.references import get_references
 from bombe.query.search import search_symbols
 from bombe.query.structure import get_structure
+from bombe.query.federated.executor import FederatedQueryExecutor
 from bombe.store.database import Database
+from bombe.store.sharding.catalog import ShardCatalog
+from bombe.store.sharding.router import ShardRouter
 from bombe.workspace import enabled_workspace_roots, load_workspace_config
 
 
@@ -230,6 +233,76 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_disabled": {"type": "boolean", "default": False},
             "diagnostics_limit": {"type": "integer", "default": 20},
         },
+    },
+}
+
+TOOL_SCHEMAS["federated_search_symbols"] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "kind": {
+            "type": "string",
+            "enum": ["function", "class", "method", "interface", "constant", "any"],
+            "default": "any",
+        },
+        "file_pattern": {"type": "string"},
+        "limit": {"type": "integer", "default": 20},
+        "shard_filter": {"type": "array", "items": {"type": "string"}},
+        "include_explanations": {"type": "boolean", "default": False},
+    },
+    "required": ["query"],
+}
+
+TOOL_SCHEMAS["federated_get_references"] = {
+    "type": "object",
+    "properties": {
+        "symbol_name": {"type": "string"},
+        "direction": {
+            "type": "string",
+            "enum": ["callers", "callees", "both", "implementors", "supers"],
+            "default": "both",
+        },
+        "depth": {"type": "integer", "default": 1, "minimum": 1, "maximum": 5},
+        "include_source": {"type": "boolean", "default": False},
+        "include_cross_repo": {"type": "boolean", "default": True},
+        "include_explanations": {"type": "boolean", "default": False},
+    },
+    "required": ["symbol_name"],
+}
+
+TOOL_SCHEMAS["federated_get_blast_radius"] = {
+    "type": "object",
+    "properties": {
+        "symbol_name": {"type": "string"},
+        "change_type": {
+            "type": "string",
+            "enum": ["behavior", "signature", "delete"],
+            "default": "behavior",
+        },
+        "max_depth": {"type": "integer", "default": 3, "minimum": 1, "maximum": 5},
+        "include_explanations": {"type": "boolean", "default": False},
+    },
+    "required": ["symbol_name"],
+}
+
+TOOL_SCHEMAS["get_cross_repo_edges"] = {
+    "type": "object",
+    "properties": {
+        "symbol_name": {"type": "string"},
+        "direction": {
+            "type": "string",
+            "enum": ["outgoing", "incoming", "both"],
+            "default": "both",
+        },
+        "limit": {"type": "integer", "default": 50},
+    },
+    "required": ["symbol_name"],
+}
+
+TOOL_SCHEMAS["get_shard_status"] = {
+    "type": "object",
+    "properties": {
+        "include_health_check": {"type": "boolean", "default": True},
     },
 }
 
@@ -1037,10 +1110,146 @@ def _workspace_status_handler(db: Database, repo_root: str, payload: dict[str, A
     }
 
 
+def _federated_search_handler(
+    executor: FederatedQueryExecutor, payload: dict[str, Any]
+) -> dict[str, Any]:
+    from bombe.query.guards import MAX_SEARCH_LIMIT
+    req = SymbolSearchRequest(
+        query=truncate_query(str(payload["query"])),
+        kind=str(payload.get("kind", "any")),
+        file_pattern=payload.get("file_pattern"),
+        limit=clamp_limit(int(payload.get("limit", 20)), maximum=MAX_SEARCH_LIMIT),
+    )
+    result = executor.execute_search(req)
+    return {
+        "symbols": result.results,
+        "total_matches": result.total_matches,
+        "shards_queried": result.shards_queried,
+        "shards_failed": result.shards_failed,
+        "shard_reports": result.shard_reports,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+def _federated_references_handler(
+    executor: FederatedQueryExecutor, payload: dict[str, Any]
+) -> dict[str, Any]:
+    from bombe.query.guards import MAX_REFERENCE_DEPTH
+    symbol_name = str(payload["symbol_name"])
+    direction = str(payload.get("direction", "both"))
+    depth = clamp_depth(int(payload.get("depth", 1)), maximum=MAX_REFERENCE_DEPTH)
+    include_source = bool(payload.get("include_source", False))
+    result = executor.execute_references(symbol_name, direction, depth, include_source)
+    output = result.results[0] if result.results else {}
+    return {
+        **output,
+        "shards_queried": result.shards_queried,
+        "shards_failed": result.shards_failed,
+        "shard_reports": result.shard_reports,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+def _federated_blast_handler(
+    executor: FederatedQueryExecutor, payload: dict[str, Any]
+) -> dict[str, Any]:
+    from bombe.query.guards import MAX_IMPACT_DEPTH
+    symbol_name = str(payload["symbol_name"])
+    change_type = str(payload.get("change_type", "behavior"))
+    max_depth = clamp_depth(int(payload.get("max_depth", 3)), maximum=MAX_IMPACT_DEPTH)
+    result = executor.execute_blast_radius(symbol_name, change_type, max_depth)
+    return {
+        "shard_results": result.results,
+        "total_affected": result.total_matches,
+        "shards_queried": result.shards_queried,
+        "shards_failed": result.shards_failed,
+        "shard_reports": result.shard_reports,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+def _cross_repo_edges_handler(
+    catalog: ShardCatalog, payload: dict[str, Any]
+) -> dict[str, Any]:
+    symbol_name = str(payload["symbol_name"])
+    direction = str(payload.get("direction", "both"))
+    limit = max(1, int(payload.get("limit", 50)))
+
+    edges: list[dict[str, Any]] = []
+
+    if direction in ("outgoing", "both"):
+        # Search all shards for outgoing edges matching this symbol
+        shards = catalog.list_shards(enabled_only=True)
+        for shard in shards:
+            for edge in catalog.get_cross_repo_edges_from(shard.repo_id, symbol_name):
+                edges.append({
+                    "source_repo_id": edge.source_uri.repo_id,
+                    "source_qualified_name": edge.source_uri.qualified_name,
+                    "source_file_path": edge.source_uri.file_path,
+                    "target_repo_id": edge.target_uri.repo_id,
+                    "target_qualified_name": edge.target_uri.qualified_name,
+                    "target_file_path": edge.target_uri.file_path,
+                    "relationship": edge.relationship,
+                    "confidence": edge.confidence,
+                    "direction": "outgoing",
+                })
+
+    if direction in ("incoming", "both"):
+        shards = catalog.list_shards(enabled_only=True)
+        for shard in shards:
+            for edge in catalog.get_cross_repo_edges_to(shard.repo_id, symbol_name):
+                edges.append({
+                    "source_repo_id": edge.source_uri.repo_id,
+                    "source_qualified_name": edge.source_uri.qualified_name,
+                    "source_file_path": edge.source_uri.file_path,
+                    "target_repo_id": edge.target_uri.repo_id,
+                    "target_qualified_name": edge.target_uri.qualified_name,
+                    "target_file_path": edge.target_uri.file_path,
+                    "relationship": edge.relationship,
+                    "confidence": edge.confidence,
+                    "direction": "incoming",
+                })
+
+    return {"edges": edges[:limit], "total": len(edges)}
+
+
+def _shard_status_handler(
+    catalog: ShardCatalog,
+    router: ShardRouter,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    include_health = bool(payload.get("include_health_check", True))
+    shards = catalog.list_shards(enabled_only=False)
+    result: dict[str, Any] = {
+        "shards": [
+            {
+                "repo_id": s.repo_id,
+                "repo_path": s.repo_path,
+                "enabled": s.enabled,
+                "symbol_count": s.symbol_count,
+                "edge_count": s.edge_count,
+                "last_indexed_at": s.last_indexed_at,
+            }
+            for s in shards
+        ],
+    }
+    if include_health:
+        result["health"] = router.shard_health()
+
+    cross_count = catalog.query("SELECT COUNT(*) AS cnt FROM cross_repo_edges;")
+    exported_count = catalog.query("SELECT COUNT(*) AS cnt FROM exported_symbols;")
+    result["cross_repo_edge_count"] = int(cross_count[0]["cnt"]) if cross_count else 0
+    result["exported_symbol_count"] = int(exported_count[0]["cnt"]) if exported_count else 0
+    return result
+
+
 def build_tool_registry(
     db: Database,
     repo_root: str,
     plugin_manager: PluginManager | None = None,
+    federated_executor: FederatedQueryExecutor | None = None,
+    shard_catalog: ShardCatalog | None = None,
+    shard_router: ShardRouter | None = None,
 ) -> dict[str, dict[str, Any]]:
     planner = QueryPlanner(max_entries=1024, ttl_seconds=30.0)
     search_handler = _instrument_handler(
@@ -1161,7 +1370,7 @@ def build_tool_registry(
         planner=None,
         plugin_manager=plugin_manager,
     )
-    return {
+    registry = {
         "search_symbols": {
             "description": "Search for symbols by name, kind, and file path.",
             "input_schema": TOOL_SCHEMAS["search_symbols"],
@@ -1243,6 +1452,31 @@ def build_tool_registry(
             "handler": workspace_status_handler,
         },
     }
+
+    # -- Federated tools (only if sharding is configured) --
+    if federated_executor is not None and shard_catalog is not None and shard_router is not None:
+        registry["federated_search_symbols"] = {
+            "schema": TOOL_SCHEMAS["federated_search_symbols"],
+            "handler": lambda payload: _federated_search_handler(federated_executor, payload),
+        }
+        registry["federated_get_references"] = {
+            "schema": TOOL_SCHEMAS["federated_get_references"],
+            "handler": lambda payload: _federated_references_handler(federated_executor, payload),
+        }
+        registry["federated_get_blast_radius"] = {
+            "schema": TOOL_SCHEMAS["federated_get_blast_radius"],
+            "handler": lambda payload: _federated_blast_handler(federated_executor, payload),
+        }
+        registry["get_cross_repo_edges"] = {
+            "schema": TOOL_SCHEMAS["get_cross_repo_edges"],
+            "handler": lambda payload: _cross_repo_edges_handler(shard_catalog, payload),
+        }
+        registry["get_shard_status"] = {
+            "schema": TOOL_SCHEMAS["get_shard_status"],
+            "handler": lambda payload: _shard_status_handler(shard_catalog, shard_router, payload),
+        }
+
+    return registry
 
 
 def register_tools(

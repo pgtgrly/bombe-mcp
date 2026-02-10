@@ -11,7 +11,7 @@ from typing import Any, Sequence
 from bombe.models import EdgeRecord, ExternalDepRecord, FileRecord, SymbolRecord
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_STATEMENTS = (
     """
@@ -454,6 +454,15 @@ class Database:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_index_diag_severity_created ON indexing_diagnostics(severity, created_at);"
+        )
+
+    def _migrate_to_v7(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_deps_module ON external_deps(module_name);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_deps_file_module "
+            "ON external_deps(file_path, module_name);"
         )
 
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:

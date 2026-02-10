@@ -16,6 +16,13 @@ MAX_GRAPH_VISITED = 2000
 MAX_GRAPH_EDGES = 5000
 MAX_CONTEXT_SEEDS = 32
 
+# Federated query guards
+MAX_SHARDS_PER_QUERY = 16
+MAX_CROSS_REPO_EDGES_PER_QUERY = 200
+MAX_FEDERATED_RESULTS = 500
+FEDERATED_SHARD_TIMEOUT_MS = 5000
+MAX_EXPORTED_SYMBOLS_REFRESH = 50000
+
 
 def clamp_int(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))

@@ -323,3 +323,92 @@ class ContextResponse:
 @dataclass(frozen=True)
 class BlastRadiusResponse:
     payload: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Cross-repo graphing and sharding models
+# ---------------------------------------------------------------------------
+
+
+def _repo_id_from_path(canonical_path: str) -> str:
+    return hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class GlobalSymbolURI:
+    """Globally unique symbol identifier across repositories."""
+
+    repo_id: str
+    qualified_name: str
+    file_path: str
+
+    @property
+    def uri(self) -> str:
+        return f"bombe://{self.repo_id}/{self.qualified_name}#{self.file_path}"
+
+    @classmethod
+    def from_uri(cls, uri: str) -> "GlobalSymbolURI":
+        if not uri.startswith("bombe://"):
+            raise ValueError(f"Invalid GlobalSymbolURI: {uri}")
+        rest = uri[len("bombe://"):]
+        slash_idx = rest.index("/")
+        repo_id = rest[:slash_idx]
+        remainder = rest[slash_idx + 1:]
+        hash_idx = remainder.index("#")
+        qualified_name = remainder[:hash_idx]
+        file_path = remainder[hash_idx + 1:]
+        return cls(repo_id=repo_id, qualified_name=qualified_name, file_path=file_path)
+
+    @classmethod
+    def from_symbol(cls, repo_id: str, symbol: SymbolRecord) -> "GlobalSymbolURI":
+        return cls(
+            repo_id=repo_id,
+            qualified_name=symbol.qualified_name,
+            file_path=symbol.file_path,
+        )
+
+
+@dataclass(frozen=True)
+class ShardInfo:
+    """Metadata about a single shard (repo database) in a shard group."""
+
+    repo_id: str
+    repo_path: str
+    db_path: str
+    enabled: bool = True
+    last_indexed_at: str | None = None
+    symbol_count: int = 0
+    edge_count: int = 0
+
+
+@dataclass(frozen=True)
+class CrossRepoEdge:
+    """An edge between symbols in different repositories."""
+
+    source_uri: GlobalSymbolURI
+    target_uri: GlobalSymbolURI
+    relationship: str
+    confidence: float = 1.0
+    provenance: str = "import_resolution"
+
+
+@dataclass(frozen=True)
+class ShardGroupConfig:
+    """Configuration for a group of repos that may reference each other."""
+
+    name: str
+    catalog_db_path: str
+    shards: list[ShardInfo] = field(default_factory=list)
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class FederatedQueryResult:
+    """Result from a query that spans multiple shards."""
+
+    results: list[dict[str, Any]] = field(default_factory=list)
+    shard_reports: list[dict[str, Any]] = field(default_factory=list)
+    total_matches: int = 0
+    shards_queried: int = 0
+    shards_failed: int = 0
+    elapsed_ms: int = 0

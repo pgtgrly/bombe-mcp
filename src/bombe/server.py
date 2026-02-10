@@ -24,10 +24,13 @@ from bombe.store.database import Database, SCHEMA_VERSION
 from bombe.plugins import PluginManager
 from bombe.tools.definitions import build_tool_registry, register_tools
 from bombe.ui_api import build_inspector_bundle
+from bombe.store.sharding.catalog import ShardCatalog
+from bombe.store.sharding.cross_repo_resolver import post_index_cross_repo_sync
 from bombe.workspace import (
     build_workspace_config,
     default_workspace_file,
     enabled_workspace_roots,
+    load_shard_group_config,
     load_workspace_config,
     save_workspace_config,
 )
@@ -269,6 +272,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply safe automatic repairs (schema sync, queue normalization, cache epoch bootstrap).",
     )
+    # -- Shard commands --
+    shard_init_parser = subparsers.add_parser(
+        "shard-init",
+        help="Initialize shard catalog for cross-repo graphing.",
+    )
+    shard_init_parser.add_argument("--workspace-file", type=Path, default=None)
+
+    shard_sync_parser = subparsers.add_parser(
+        "shard-sync",
+        help="Refresh cross-repo symbol exports and edge resolution.",
+    )
+    shard_sync_parser.add_argument("--workspace-file", type=Path, default=None)
+    shard_sync_parser.add_argument("--workers", type=int, default=4)
+
+    shard_status_parser = subparsers.add_parser(
+        "shard-status",
+        help="Print shard group health and cross-repo edge statistics.",
+    )
+    shard_status_parser.add_argument("--workspace-file", type=Path, default=None)
+
     parser.set_defaults(command="serve")
     return parser
 
@@ -1286,6 +1309,98 @@ def _run_watch(
     }
 
 
+def _run_shard_init(repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Initialize shard catalog from workspace config."""
+    workspace_file = getattr(args, "workspace_file", None)
+    shard_config = load_shard_group_config(repo_root, workspace_file=workspace_file)
+    if shard_config is None:
+        return {"error": "Sharding not enabled. Add shard_group to workspace.json."}
+
+    catalog = ShardCatalog(Path(shard_config.catalog_db_path))
+    catalog.init_schema()
+
+    registered = 0
+    for shard in shard_config.shards:
+        catalog.register_shard(shard)
+        registered += 1
+
+    return {
+        "catalog_db_path": shard_config.catalog_db_path,
+        "shards_registered": registered,
+        "shard_group_name": shard_config.name,
+    }
+
+
+def _run_shard_sync(repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Refresh exported symbols and resolve cross-repo imports."""
+    workspace_file = getattr(args, "workspace_file", None)
+    shard_config = load_shard_group_config(repo_root, workspace_file=workspace_file)
+    if shard_config is None:
+        return {"error": "Sharding not enabled. Add shard_group to workspace.json."}
+
+    catalog = ShardCatalog(Path(shard_config.catalog_db_path))
+    catalog.init_schema()
+
+    sync_results: list[dict[str, Any]] = []
+    for shard in shard_config.shards:
+        if not shard.enabled:
+            continue
+        shard_root = Path(shard.repo_path)
+        if not shard_root.exists():
+            sync_results.append({"repo_id": shard.repo_id, "status": "missing_root"})
+            continue
+        try:
+            shard_db = Database(Path(shard.db_path))
+            shard_db.init_schema()
+            result = post_index_cross_repo_sync(shard_root, shard_db, catalog)
+            result["status"] = "synced"
+            sync_results.append(result)
+        except Exception as exc:
+            sync_results.append({
+                "repo_id": shard.repo_id,
+                "status": "error",
+                "error": str(exc),
+            })
+
+    return {"shard_sync_results": sync_results}
+
+
+def _run_shard_status(repo_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Print shard group health and statistics."""
+    workspace_file = getattr(args, "workspace_file", None)
+    shard_config = load_shard_group_config(repo_root, workspace_file=workspace_file)
+    if shard_config is None:
+        return {"error": "Sharding not enabled. Add shard_group to workspace.json."}
+
+    catalog = ShardCatalog(Path(shard_config.catalog_db_path))
+    catalog.init_schema()
+
+    shards = catalog.list_shards(enabled_only=False)
+    cross_edge_count = catalog.query(
+        "SELECT COUNT(*) AS cnt FROM cross_repo_edges;"
+    )
+    exported_count = catalog.query(
+        "SELECT COUNT(*) AS cnt FROM exported_symbols;"
+    )
+
+    return {
+        "shard_group_name": shard_config.name,
+        "catalog_db_path": shard_config.catalog_db_path,
+        "shards": [
+            {
+                "repo_id": s.repo_id,
+                "repo_path": s.repo_path,
+                "enabled": s.enabled,
+                "symbol_count": s.symbol_count,
+                "edge_count": s.edge_count,
+            }
+            for s in shards
+        ],
+        "cross_repo_edges": int(cross_edge_count[0]["cnt"]) if cross_edge_count else 0,
+        "exported_symbols": int(exported_count[0]["cnt"]) if exported_count else 0,
+    }
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -1372,7 +1487,50 @@ def main() -> None:
             include_disabled=bool(getattr(args, "include_disabled", False)),
             plugin_manager=plugin_manager,
         )
+        # Post-index shard sync if sharding is enabled
+        shard_config = load_shard_group_config(
+            settings.repo_root,
+            workspace_file=workspace_file,
+        )
+        if shard_config is not None:
+            try:
+                catalog = ShardCatalog(Path(shard_config.catalog_db_path))
+                catalog.init_schema()
+                shard_sync_results = []
+                for root_entry in payload.get("runs", []):
+                    if root_entry.get("status") != "indexed":
+                        continue
+                    root_path = Path(root_entry["root_path"])
+                    root_db_path = Path(root_entry["db_path"])
+                    if root_path.exists():
+                        try:
+                            root_db = Database(root_db_path)
+                            root_db.init_schema()
+                            sync_result = post_index_cross_repo_sync(root_path, root_db, catalog)
+                            shard_sync_results.append(sync_result)
+                        except Exception as exc:
+                            logging.getLogger(__name__).warning(
+                                "Post-index shard sync failed for %s: %s", root_path, exc
+                            )
+                payload["shard_sync"] = shard_sync_results
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Shard sync failed: %s", exc)
         print(json.dumps(payload, sort_keys=True))
+        return
+
+    if command == "shard-init":
+        payload = _run_shard_init(settings.repo_root, args)
+        print(json.dumps(payload, indent=2))
+        return
+
+    if command == "shard-sync":
+        payload = _run_shard_sync(settings.repo_root, args)
+        print(json.dumps(payload, indent=2))
+        return
+
+    if command == "shard-status":
+        payload = _run_shard_status(settings.repo_root, args)
+        print(json.dumps(payload, indent=2))
         return
 
     plugin_manager = PluginManager.from_repo(settings.repo_root)
