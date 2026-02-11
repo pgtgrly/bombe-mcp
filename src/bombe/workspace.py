@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +83,10 @@ def save_workspace_config(
     payload = {
         "name": config.name,
         "version": int(config.version),
-        "roots": [asdict(root) for root in config.roots],
+        "roots": [
+            {"id": root.id, "path": root.path, "db_path": root.db_path, "enabled": root.enabled}
+            for root in config.roots
+        ],
     }
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return target

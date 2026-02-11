@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from bombe.models import (
     ARTIFACT_SCHEMA_VERSION,
@@ -10,6 +10,7 @@ from bombe.models import (
     EdgeContractRecord,
     IndexDelta,
     SymbolKey,
+    model_replace,
 )
 from bombe.sync.client import build_artifact_checksum
 
@@ -83,7 +84,7 @@ def promote_delta(
     return PromotionResult(
         promoted=True,
         reason="promoted",
-        artifact=replace(artifact, checksum=build_artifact_checksum(artifact)),
+        artifact=model_replace(artifact, checksum=build_artifact_checksum(artifact)),
     )
 
 
@@ -135,4 +136,4 @@ def reconcile_artifact(
         impact_priors=artifact.impact_priors,
         flow_hints=artifact.flow_hints,
     )
-    return replace(merged, checksum=build_artifact_checksum(merged))
+    return model_replace(merged, checksum=build_artifact_checksum(merged))

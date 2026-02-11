@@ -736,7 +736,7 @@ def _status_payload(
     error_count = int(diagnostics_summary.get("by_severity", {}).get("error", 0))
     return {
         "repo_root": repo_root.as_posix(),
-        "db_path": db.db_path.as_posix(),
+        "db_path": db.db_path,
         "schema_version": schema_version,
         "counts": {
             "files": int(file_rows[0]["count"]) if file_rows else 0,
@@ -946,12 +946,12 @@ def _doctor_payload(
         }
     )
 
-    db_writable = _is_path_writable(db.db_path.parent)
+    db_writable = _is_path_writable(Path(db.db_path).parent)
     checks.append(
         {
             "name": "db_directory_writable",
             "status": "ok" if db_writable else "degraded",
-            "detail": {"path": db.db_path.parent.as_posix()},
+            "detail": {"path": Path(db.db_path).parent.as_posix()},
         }
     )
 
@@ -1114,7 +1114,7 @@ def _doctor_payload(
         "status": overall_status,
         "runtime_profile": runtime_profile,
         "repo_root": repo_root.as_posix(),
-        "db_path": db.db_path.as_posix(),
+        "db_path": db.db_path,
         "fixes_applied": fixes_applied,
         "checks": checks,
         "indexing_diagnostics_summary": diagnostics_summary,

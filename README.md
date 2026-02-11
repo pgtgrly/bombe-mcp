@@ -52,20 +52,24 @@ The runtime is local-first and works without any control plane. Optional hybrid 
 ## Requirements
 
 - Python `>=3.11`
+- Rust stable toolchain ([rustup](https://rustup.rs/))
+- [maturin](https://www.maturin.rs/) (`pip install maturin`)
 - A local checkout of the repository to index
 - Write access to the configured DB location
 
 ## Install
 
-Install package:
+Build and install the Rust extension, then the Python package:
 
 ```bash
+maturin develop --manifest-path crates/bombe-core/Cargo.toml
 python3 -m pip install .
 ```
 
 Developer install:
 
 ```bash
+maturin develop --manifest-path crates/bombe-core/Cargo.toml
 python3 -m pip install ".[dev]"
 ```
 
@@ -331,14 +335,14 @@ Strict contract behavior is verified by:
 
 ## Architecture
 
-Bombe is split into local runtime modules and optional hybrid modules.
+Bombe uses a Rust core (`_bombe_core` via PyO3/maturin) for all compute-heavy operations, with thin Python wrappers providing the MCP-facing API.
 
 ### Local runtime
 
-- File scanning and language detection
-- Parser plus symbol extraction plus call/import resolution
+- File scanning and language detection (Rust)
+- Tree-sitter parsing plus symbol extraction plus call/import resolution (Rust)
 - Optional semantic receiver-type hints merged into call resolution
-- SQLite graph storage
+- SQLite graph storage (Rust via rusqlite)
   - `files`
   - `symbols`
   - `edges`
@@ -517,9 +521,8 @@ PYTHONPATH=src python3 -m bombe.server --repo . --init-only --log-level INFO
 
 CI jobs in `.github/workflows/ci.yml`:
 
-- `lint-and-typecheck`
-- `test`
-- `release-gates`
+- `rust-check` — fmt, clippy, Rust unit tests
+- `python-with-rust` — build extension, Python tests, coverage (90% threshold), lint, type check
 
 Recommended local all-check run:
 
@@ -550,10 +553,10 @@ Detailed execution plan:
 
 ## Verification Snapshot
 
-Latest local verification run (2026-02-08):
+Latest local verification run (2026-02-10):
 
 - `PYTHONPATH=src python3 -m compileall src tests` -> pass
-- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`100` tests)
+- `PYTHONPATH=src python3 -W error -m unittest discover -s tests -p "test_*.py"` -> pass (`190` tests, `8` skipped perf benchmarks)
 - `BOMBE_RUN_PERF=1 BOMBE_PERF_HISTORY=/tmp/bombe-perf-history.final.jsonl PYTHONPATH=src python3 -m unittest discover -s tests/perf -p "test_*.py" -v` -> pass (`6` tests, `1` skipped when `BOMBE_REAL_REPO_PATHS` is unset)
 - `PYTHONPATH=src python3 -m bombe.release.gates --history /tmp/bombe-perf-history.final.jsonl` -> `RELEASE_GATES=PASS`
 

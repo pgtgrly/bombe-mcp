@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import time
 import unittest
-from dataclasses import replace
-
 from bombe.models import ARTIFACT_SCHEMA_VERSION, DeltaHeader, IndexDelta, SymbolKey
-from bombe.models import ArtifactBundle
+from bombe.models import ArtifactBundle, model_replace
 from bombe.sync.client import (
     ArtifactQuarantineStore,
     CircuitBreaker,
@@ -56,9 +54,9 @@ def _build_artifact(
         promoted_symbols=[symbol_key],
     )
     if with_checksum:
-        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
+        artifact = model_replace(artifact, checksum=build_artifact_checksum(artifact))
     if signing_key:
-        artifact = replace(artifact, signature=build_artifact_signature(artifact, signing_key))
+        artifact = model_replace(artifact, signature=build_artifact_signature(artifact, signing_key))
     return artifact
 
 
@@ -143,7 +141,7 @@ class SyncClientTests(unittest.TestCase):
 
     def test_pull_artifact_checksum_mismatch_is_quarantined(self) -> None:
         clean_artifact = _build_artifact()
-        bad_artifact = replace(clean_artifact, checksum="bad")
+        bad_artifact = model_replace(clean_artifact, checksum="bad")
         quarantine = ArtifactQuarantineStore()
         client = SyncClient(
             transport=_FakeTransport(artifact=bad_artifact),
@@ -203,14 +201,14 @@ class SyncClientTests(unittest.TestCase):
         artifact = _build_artifact(
             with_checksum=True,
         )
-        artifact = replace(
+        artifact = model_replace(
             artifact,
             signature_algo="ed25519",
             signing_key_id="team-key",
             signature="deadbeef",
             checksum=None,
         )
-        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
+        artifact = model_replace(artifact, checksum=build_artifact_checksum(artifact))
         client = SyncClient(
             transport=_FakeTransport(artifact=artifact),
             policy=CompatibilityPolicy(tool_version="0.1.0"),
@@ -241,14 +239,14 @@ class SyncClientTests(unittest.TestCase):
         )
 
         artifact = _build_artifact(with_checksum=True)
-        artifact = replace(
+        artifact = model_replace(
             artifact,
             signature_algo="ed25519",
             signing_key_id="team-key",
             signature=None,
         )
-        artifact = replace(artifact, checksum=build_artifact_checksum(artifact))
-        artifact = replace(
+        artifact = model_replace(artifact, checksum=build_artifact_checksum(artifact))
+        artifact = model_replace(
             artifact,
             signature=build_artifact_signature(
                 artifact,

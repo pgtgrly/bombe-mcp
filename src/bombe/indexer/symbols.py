@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import ast
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from bombe.models import ImportRecord, ParameterRecord, ParsedUnit, SymbolRecord
 
 
-def _to_module_name(path: Path) -> str:
-    without_suffix = path.with_suffix("")
+def _to_module_name(path: str | Path) -> str:
+    p = PurePosixPath(path)
+    without_suffix = p.with_suffix("")
     parts = list(without_suffix.parts)
     if without_suffix.is_absolute() and parts and parts[0] == without_suffix.anchor:
         parts = parts[1:]
@@ -28,7 +29,7 @@ def _build_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Para
         params.append(
             ParameterRecord(
                 name=arg.arg,
-                type=param_type,
+                type_=param_type,
                 position=index,
             )
         )
@@ -53,7 +54,7 @@ def _build_signature(
 
 def _python_imports(tree: ast.AST, source_path: Path) -> list[ImportRecord]:
     imports: list[ImportRecord] = []
-    rel_path = source_path.as_posix()
+    rel_path = str(source_path)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -88,7 +89,7 @@ def _python_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Import
         return [], []
 
     module = _to_module_name(parsed.path)
-    file_path = parsed.path.as_posix()
+    file_path = parsed.path
     symbols: list[SymbolRecord] = []
 
     for node in tree.body if isinstance(tree, ast.Module) else []:
@@ -208,7 +209,7 @@ GO_CONST_RE = re.compile(r"^\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 
 def _java_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRecord]]:
     lines = parsed.source.splitlines()
-    file_path = parsed.path.as_posix()
+    file_path = parsed.path
     package_name = ""
     imports: list[ImportRecord] = []
     symbols: list[SymbolRecord] = []
@@ -338,7 +339,7 @@ def _parse_parameters(params_raw: str, language: str) -> list[ParameterRecord]:
             parameters.append(
                 ParameterRecord(
                     name=name,
-                    type=param_type,
+                    type_=param_type,
                     position=index,
                 )
             )
@@ -354,7 +355,7 @@ def _normalize_type_name(type_name: str | None) -> str | None:
 
 def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRecord]]:
     lines = parsed.source.splitlines()
-    file_path = parsed.path.as_posix()
+    file_path = parsed.path
     module_name = _to_module_name(parsed.path)
     imports: list[ImportRecord] = []
     symbols: list[SymbolRecord] = []
@@ -501,7 +502,7 @@ def _typescript_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[Im
 
 def _go_symbols(parsed: ParsedUnit) -> tuple[list[SymbolRecord], list[ImportRecord]]:
     lines = parsed.source.splitlines()
-    file_path = parsed.path.as_posix()
+    file_path = parsed.path
     package_name = ""
     imports: list[ImportRecord] = []
     symbols: list[SymbolRecord] = []

@@ -7,7 +7,7 @@ name = "bombe"
 version = "0.1.0"
 description = "Structure-aware code retrieval MCP server for AI coding agents."
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11"
 authors = [
   { name = "Bombe Contributors" }
 ]
@@ -41,6 +41,11 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.maturin]
+module-name = "_bombe_core"
+manifest-path = "crates/bombe-core/Cargo.toml"
+python-source = "src"
 
 [tool.mypy]
 python_version = "3.11"

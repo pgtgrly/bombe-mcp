@@ -10,7 +10,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -59,7 +59,8 @@ class ControlPlaneTransport(Protocol):
 
 
 def build_artifact_checksum(artifact: ArtifactBundle) -> str:
-    payload = asdict(artifact)
+    from bombe.models import model_to_dict
+    payload = model_to_dict(artifact)
     payload.pop("checksum", None)
     payload.pop("signature", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -73,7 +74,8 @@ def validate_artifact_checksum(artifact: ArtifactBundle) -> bool:
 
 
 def _signature_payload(artifact: ArtifactBundle) -> str:
-    payload = asdict(artifact)
+    from bombe.models import model_to_dict
+    payload = model_to_dict(artifact)
     payload.pop("signature", None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return canonical

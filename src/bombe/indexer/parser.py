@@ -123,7 +123,7 @@ def parse_file(path: Path, language: str) -> ParsedUnit:
                 tree = None
 
     return ParsedUnit(
-        path=path,
+        path=str(path),
         language=language,
         source=source,
         tree=tree,

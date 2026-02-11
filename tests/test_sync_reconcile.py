@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
-
 from bombe.models import (
     ArtifactBundle,
     DeltaHeader,
@@ -12,6 +10,7 @@ from bombe.models import (
     QualityStats,
     SymbolKey,
     SymbolRecord,
+    model_replace,
 )
 from bombe.sync.client import build_artifact_checksum
 from bombe.sync.reconcile import promote_delta, reconcile_artifact
@@ -89,7 +88,7 @@ def _artifact() -> ArtifactBundle:
         promoted_symbols=[stale_symbol, untouched_symbol],
         promoted_edges=[stale_edge],
     )
-    return replace(artifact, checksum=build_artifact_checksum(artifact))
+    return model_replace(artifact, checksum=build_artifact_checksum(artifact))
 
 
 class SyncReconcileTests(unittest.TestCase):
@@ -106,7 +105,7 @@ class SyncReconcileTests(unittest.TestCase):
         self.assertTrue(bool(result.artifact and result.artifact.checksum))
 
     def test_promote_delta_rejects_high_ambiguity(self) -> None:
-        noisy = replace(_delta(), quality_stats=QualityStats(ambiguity_rate=0.8, parse_failures=0))
+        noisy = model_replace(_delta(), quality_stats=QualityStats(ambiguity_rate=0.8, parse_failures=0))
         result = promote_delta(
             noisy,
             artifact_id="artifact_new",

@@ -583,7 +583,7 @@ def build_call_edges(
                     source_type="symbol",
                     target_type="symbol",
                     relationship="CALLS",
-                    file_path=parsed.path.as_posix(),
+                    file_path=parsed.path,
                     line_number=callsite.line_number,
                     confidence=confidence,
                 )

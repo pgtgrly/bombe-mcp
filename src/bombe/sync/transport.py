@@ -5,14 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import replace
-from dataclasses import asdict
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from bombe.models import ArtifactBundle, EdgeContractRecord, IndexDelta, SymbolKey
+from bombe.models import ArtifactBundle, EdgeContractRecord, IndexDelta, SymbolKey, model_replace, model_to_dict
 from bombe.sync.client import build_artifact_checksum, build_artifact_signature
 from bombe.sync.reconcile import promote_delta
 
@@ -126,7 +124,7 @@ class FileControlPlaneTransport:
         repo_delta_dir = self._repo_delta_dir(delta.header.repo_id)
         snapshot_key = _safe_snapshot(delta.header.local_snapshot)
         delta_path = repo_delta_dir / f"{snapshot_key}.json"
-        delta_path.write_text(json.dumps(asdict(delta), sort_keys=True), encoding="utf-8")
+        delta_path.write_text(json.dumps(model_to_dict(delta), sort_keys=True), encoding="utf-8")
 
         promoted = promote_delta(
             delta,
@@ -139,16 +137,16 @@ class FileControlPlaneTransport:
             artifact_dir = self._repo_artifact_dir(delta.header.repo_id)
             artifact = promoted.artifact
             if self.signing_key:
-                artifact = replace(
+                artifact = model_replace(
                     artifact,
                     signature_algo=self.signing_algorithm,
                     signing_key_id=self.signing_key_id,
                 )
-                artifact = replace(
+                artifact = model_replace(
                     artifact,
                     checksum=build_artifact_checksum(artifact),
                 )
-                artifact = replace(
+                artifact = model_replace(
                     artifact,
                     signature=build_artifact_signature(
                         artifact,
@@ -156,7 +154,7 @@ class FileControlPlaneTransport:
                         algorithm=self.signing_algorithm,
                     ),
                 )
-            artifact_payload = asdict(artifact)
+            artifact_payload = model_to_dict(artifact)
             artifact_path = artifact_dir / f"{promoted.artifact.artifact_id}.json"
             latest_path = artifact_dir / "latest.json"
             artifact_path.write_text(json.dumps(artifact_payload, sort_keys=True), encoding="utf-8")
@@ -229,7 +227,7 @@ class HttpControlPlaneTransport:
         status, payload = self._request_json(
             "POST",
             "/v1/deltas",
-            payload={"delta": asdict(delta)},
+            payload={"delta": model_to_dict(delta)},
         )
         if status >= 400:
             return {"accepted": False, "error_status": status}

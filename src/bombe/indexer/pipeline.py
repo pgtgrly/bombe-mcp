@@ -122,7 +122,7 @@ def _extract_file_worker(job: tuple[str, str, str]) -> _ExtractionResult:
             error_message=str(exc),
         )
     parsed = ParsedUnit(
-        path=Path(relative_path),
+        path=relative_path,
         language=parsed_raw.language,
         source=parsed_raw.source,
         tree=parsed_raw.tree,
@@ -357,7 +357,7 @@ def _rebuild_dependencies(
             continue
 
         parsed_cache[file_record.path] = ParsedUnit(
-            path=Path(file_record.path),
+            path=file_record.path,
             language=file_record.language,
             source=result.source,
             tree=result.python_tree if file_record.language == "python" else None,

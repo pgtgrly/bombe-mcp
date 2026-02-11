@@ -692,7 +692,7 @@ def _server_status_handler(
     metrics_summary = _tool_metrics_summary(db, limit=max(metrics_limit, 50))
     return {
         "repo_root": repo_root,
-        "db_path": db.db_path.as_posix(),
+        "db_path": db.db_path,
         "counts": {
             "files": int(file_rows[0]["count"]) if file_rows else 0,
             "symbols": int(symbol_rows[0]["count"]) if symbol_rows else 0,

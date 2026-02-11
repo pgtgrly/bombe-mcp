@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import threading
-from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -59,7 +58,7 @@ def _symbol_record_from_payload(payload: dict[str, Any]) -> SymbolRecord:
             ParameterRecord(
                 name=str(item.get("name", "")),
                 position=int(item.get("position", 0)),
-                type=item.get("type"),
+                type_=item.get("type"),
                 default_value=item.get("default_value"),
             )
         )
@@ -190,7 +189,8 @@ class ReferenceControlPlaneServer:
         )
         if artifact is None:
             return None
-        return asdict(artifact)
+        from bombe.models import model_to_dict
+        return model_to_dict(artifact)
 
     def start(self) -> str:
         if self._httpd is not None:

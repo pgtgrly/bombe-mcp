@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from bombe import __version__
-from bombe.models import DELTA_SCHEMA_VERSION, DeltaHeader, FileChange, FileDelta, IndexDelta, QualityStats
+from bombe.models import DELTA_SCHEMA_VERSION, DeltaHeader, FileChange, FileDelta, IndexDelta, QualityStats, model_to_dict
 from bombe.models import EdgeContractRecord, SymbolKey
 from bombe.store.database import Database
 from bombe.sync.client import ArtifactQuarantineStore, CircuitBreaker, CompatibilityPolicy, SyncClient
@@ -269,7 +269,7 @@ def run_sync_cycle(
         trusted_verification_keys=trusted_verification_keys,
     )
     try:
-        queue_payload = json.dumps(asdict(delta), sort_keys=True)
+        queue_payload = json.dumps(model_to_dict(delta), sort_keys=True)
         queue_id = db.enqueue_sync_delta(repo_identifier, delta.header.local_snapshot, queue_payload)
         push_result = client.push_delta(delta)
         db.mark_sync_delta_status(

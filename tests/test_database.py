@@ -56,7 +56,7 @@ class DatabaseTests(unittest.TestCase):
                         start_line=1,
                         end_line=3,
                         parameters=[
-                            ParameterRecord(name="name", type="str", position=0),
+                            ParameterRecord(name="name", type_="str", position=0),
                         ],
                     )
                 ],
